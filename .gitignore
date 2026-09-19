@@ -1,0 +1,9 @@
+# TLS private keys
+certs/*.pem
+
+# Environment variables
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
