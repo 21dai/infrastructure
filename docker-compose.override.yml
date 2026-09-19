@@ -1,0 +1,23 @@
+# Ajustes locales para pruebas de carga. Docker Compose lo combina solo con
+# docker-compose.yml cuando esta en la misma carpeta. Solo variables de
+# entorno: no cambia ninguna imagen ni el codigo de los servicios.
+#
+# Para levantar SIN estos ajustes:
+#   docker compose -f docker-compose.yml up -d
+services:
+  pdf-extractext:
+    environment:
+      # Procesos de uvicorn = PDFs que se extraen en paralelo (la PC tiene 8 nucleos).
+      WEB_CONCURRENCY: 8
+
+  orchestrator:
+    environment:
+      # Un PDF grande tarda 3-4 s solo; en cola detras de otros puede pasar de 10 s.
+      HTTP_TIMEOUT_SECONDS: 60
+      # Bulkhead: tantos en vuelo como workers tiene pdf-extractext, y que el
+      # resto espere en cola en vez de recibir 503 a los 5 s.
+      BULKHEAD_MAX_CONCURRENT: 8
+      BULKHEAD_MAX_WAITING: 200
+      BULKHEAD_ACQUIRE_TIMEOUT_SECONDS: 60
+      # Que el circuito no se abra por lentitud normal bajo carga.
+      CIRCUIT_BREAKER_FAILURE_THRESHOLD: 20
