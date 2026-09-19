@@ -1,16 +1,18 @@
 services:
   traefik:
-    image: traefik:v3.6
+    image: traefik:v3.7.13
     container_name: traefik
+    restart: unless-stopped
 
     command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.file.directory=/config"
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
-      - "--api.insecure=true"
 
     ports:
       - "80:80"
@@ -18,18 +20,96 @@ services:
       - "8080:8080"
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./certs:/certs:ro
-      - ./config:/config:ro
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./config:/config:ro"
+      - "./certs:/certs:ro"
 
   orchestrator:
     build:
       context: ../orchestrator-service
       dockerfile: Dockerfile
 
+    restart: unless-stopped
+
+    environment:
+      PDF_EXTRACT_BASE_URL: http://pdf-extractext:8000
+
+    depends_on:
+      pdf-extractext:
+        condition: service_healthy
+
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.orchestrator.rule=Host(`orchestrator.localhost`)"
+      - "traefik.http.routers.orchestrator.rule=Host(`orchestrator.proyecto.localhost`)"
       - "traefik.http.routers.orchestrator.entrypoints=websecure"
       - "traefik.http.routers.orchestrator.tls=true"
       - "traefik.http.services.orchestrator.loadbalancer.server.port=8000"
+
+  pdf-extractext:
+    build:
+      context: ../pdf-extractext
+      dockerfile: docker/Dockerfile
+
+    container_name: pdf-extractext
+    restart: unless-stopped
+
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: mongodb://admin:9009@mongo:27017/?authSource=admin
+      DATABASE_NAME: pdf_extract
+      DATABASE_TIMEOUT_MS: 3000
+      MAX_PDF_SIZE_BYTES: 10485760
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mongo:
+    image: mongo:7-jammy
+    container_name: mongo
+    restart: unless-stopped
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: "9009"
+      MONGO_INITDB_DATABASE: pdf_extract
+
+    volumes:
+      - mongo_data:/data/db
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "-u",
+          "admin",
+          "-p",
+          "9009",
+          "--authenticationDatabase",
+          "admin",
+          "--eval",
+          "db.adminCommand({ ping: 1 }).ok",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  mongo_data:

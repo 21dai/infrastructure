@@ -2,9 +2,22 @@
 
 Infraestructura Docker del proyecto de microservicios.
 
-Este repositorio contiene la configuración necesaria para ejecutar los microservicios utilizando **Docker Compose** y **Traefik** como reverse proxy y balanceador de carga.
+Este repositorio contiene la configuración necesaria para ejecutar el sistema utilizando **Docker Compose** y **Traefik** como reverse proxy y balanceador de carga.
 
-## Estructura
+## Estructura del proyecto
+
+Los repositorios deben estar ubicados como carpetas hermanas:
+
+```text
+Proyecto/
+├── orchestrator-service/
+├── pdf-extractext/
+└── infrastructure/
+```
+
+Esto es necesario porque `docker-compose.yml` construye las imágenes utilizando rutas hacia los repositorios vecinos.
+
+## Estructura del repositorio
 
 ```text
 infrastructure/
@@ -21,58 +34,95 @@ infrastructure/
 
 Para ejecutar la infraestructura es necesario tener instalado:
 
-- Docker
+- Docker Desktop
 - Docker Compose
-- OpenSSL
+- mkcert
+
+También deben estar clonados los repositorios:
+
+- `orchestrator-service`
+- `pdf-extractext`
 
 ## Certificados TLS
 
-Los certificados utilizados para desarrollo local no se almacenan en el repositorio.
+Los certificados utilizados para desarrollo local no se almacenan en Git.
 
-Después de clonar el proyecto, generar los certificados ejecutando desde la carpeta `infrastructure`:
+Primero instalar la autoridad certificadora local de `mkcert`:
 
-```bash
-openssl req -x509 -nodes \
-  -newkey rsa:2048 \
-  -keyout certs/key.pem \
-  -out certs/cert.pem \
-  -days 365 \
-  -subj "/CN=localhost"
+```powershell
+mkcert -install
 ```
 
-Esto generará:
+Después, desde la carpeta `infrastructure`, generar los certificados:
+
+```powershell
+mkcert -cert-file certs/local-cert.pem -key-file certs/local-key.pem "*.proyecto.localhost" "proyecto.localhost" localhost 127.0.0.1 ::1
+```
+
+Esto genera:
 
 ```text
 certs/
-├── cert.pem
-└── key.pem
+├── local-cert.pem
+└── local-key.pem
 ```
 
 Estos archivos están excluidos de Git mediante `.gitignore`.
 
+## Configurar el dominio local
+
+El Orchestrator se expone mediante:
+
+```text
+https://orchestrator.proyecto.localhost
+```
+
+En Windows, si el dominio no resuelve automáticamente, agregar al archivo:
+
+```text
+C:\Windows\System32\drivers\etc\hosts
+```
+
+la siguiente línea:
+
+```text
+127.0.0.1 orchestrator.proyecto.localhost
+```
+
 ## Levantar la infraestructura
 
-Desde la carpeta `infrastructure` ejecutar:
+Desde la carpeta `infrastructure`:
 
-```bash
-docker compose up --build
+```powershell
+docker compose up -d --build
 ```
 
 Esto inicia:
 
 - Traefik
 - Orchestrator Service
-- Los servicios definidos en `docker-compose.yml`
+- PDF Extractext
+- MongoDB
 
-## Verificar los contenedores
+## Levantar varias réplicas del Orchestrator
 
-```bash
-docker compose ps
+Para ejecutar tres instancias:
+
+```powershell
+docker compose up -d --build --scale orchestrator=3
+```
+
+Traefik detecta automáticamente las réplicas y distribuye las solicitudes entre ellas.
+
+## Verificar las réplicas
+
+```powershell
+docker compose ps orchestrator
 ```
 
 ## Traefik Dashboard
 
-El dashboard de Traefik está disponible en:
+El dashboard local está disponible en:
 
 ```text
 http://localhost:8080/dashboard/
@@ -80,13 +130,11 @@ http://localhost:8080/dashboard/
 
 ## Probar el Orchestrator
 
-El endpoint de health puede probarse con:
-
-```bash
-curl -k https://orchestrator.localhost/health
+```powershell
+curl.exe -k https://orchestrator.proyecto.localhost/health
 ```
 
-La respuesta esperada es:
+Respuesta esperada:
 
 ```json
 {
@@ -94,17 +142,23 @@ La respuesta esperada es:
 }
 ```
 
-## Detener la infraestructura
+## Verificar el balanceo de carga
 
-Para detener y eliminar los contenedores creados por Docker Compose:
+Se pueden generar varias solicitudes con PowerShell:
 
-```bash
-docker compose down
+```powershell
+1..30 | ForEach-Object {
+    curl.exe -k -s -o NUL https://orchestrator.proyecto.localhost/openapi.json
+}
+```
+
+Luego se pueden revisar los logs de las réplicas:
+
+```powershell
+docker compose logs orchestrator --since 2m | Select-String "GET /openapi.json"
 ```
 
 ## Arquitectura
-
-El flujo principal de las solicitudes es:
 
 ```text
 Cliente
@@ -116,7 +170,28 @@ Traefik
 Orchestrator Service
    │
    ▼
-Microservicios
+PDF Extractext
+   │
+   ▼
+MongoDB
 ```
 
-Traefik actúa como punto de entrada a la arquitectura y se encarga del enrutamiento de las solicitudes hacia los servicios correspondientes.
+Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator.
+
+El Orchestrator se comunica internamente con `pdf-extractext` mediante la red de Docker Compose.
+
+## Detener la infraestructura
+
+```powershell
+docker compose down
+```
+
+Los datos de MongoDB se mantienen en el volumen `mongo_data`.
+
+Para eliminar también el volumen:
+
+```powershell
+docker compose down -v
+```
+
+Usar `-v` únicamente cuando se quieran eliminar también los datos persistidos en MongoDB.
