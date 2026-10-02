@@ -101,8 +101,36 @@ Esto inicia:
 
 - Traefik
 - Orchestrator Service
-- PDF Extractext
+- PDF Extractext (5 réplicas, 1 CPU y 1 GB cada una)
 - MongoDB
+
+`docker-compose.override.yml` se aplica solo y ajusta la concurrencia para las
+pruebas de carga (1 proceso de uvicorn por réplica, Bulkhead del orquestador en
+5). Para levantar sin esos ajustes:
+
+```powershell
+docker compose -f docker-compose.yml up -d --build
+```
+
+Esperar a que todo diga `healthy` en `docker compose ps` antes de probar:
+mientras arranca, Traefik no tiene a dónde mandar el tráfico y responde 404.
+
+## PDF Extractext: réplicas y POST /extract
+
+`pdf-extractext` corre con 5 réplicas (el máximo del TP de carga) y sin
+`container_name`, porque un nombre fijo impide crear réplicas. El orquestador
+lo sigue encontrando por el nombre del servicio (`http://pdf-extractext:8000`).
+
+Traefik expone **solo** `POST /extract`, directo a las réplicas y sin pasar por
+el orquestador; el CRUD de `pdf-extractext` sigue siendo interno:
+
+```powershell
+curl.exe -k -X POST https://extract.proyecto.localhost/extract -H "Content-Type: application/pdf" --data-binary "@documento.pdf"
+```
+
+Devuelve `{"content": "<Markdown>", "page_count": N}`. El contrato y las
+pruebas de carga están en el repo `pdf-extractext` (`README.md` y
+`tests/stress/`).
 
 ## Levantar varias réplicas del Orchestrator
 
@@ -164,19 +192,16 @@ docker compose logs orchestrator --since 2m | Select-String "GET /openapi.json"
 Cliente
    │
    ▼
-Traefik
-   │
-   ▼
-Orchestrator Service
-   │
-   ▼
-PDF Extractext
-   │
-   ▼
-MongoDB
+Traefik ──────── POST /extract ────────┐
+   │                                   │
+   ▼                                   ▼
+Orchestrator Service ──────▶ PDF Extractext (x5)
+                                       │
+                                       ▼
+                                    MongoDB
 ```
 
-Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator.
+Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator y, para `POST /extract`, entre las réplicas de PDF Extractext.
 
 El Orchestrator se comunica internamente con `pdf-extractext` mediante la red de Docker Compose.
 
