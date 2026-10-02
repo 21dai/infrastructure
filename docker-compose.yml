@@ -50,8 +50,17 @@ services:
       context: ../pdf-extractext
       dockerfile: docker/Dockerfile
 
-    container_name: pdf-extractext
+    # Sin container_name: con un nombre fijo Docker no puede crear replicas.
+    # El orquestador lo sigue encontrando por el nombre del servicio.
     restart: unless-stopped
+
+    deploy:
+      # Maximo que permite la consigna del TP.
+      replicas: 5
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
 
     environment:
       HOST: 0.0.0.0
@@ -77,6 +86,15 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+    labels:
+      # POST /extract directo desde Traefik, sin pasar por el orquestador:
+      # cada salto de red suma latencia al camino que mide el TP.
+      - "traefik.enable=true"
+      - "traefik.http.routers.extract.rule=Host(`extract.proyecto.localhost`) && PathPrefix(`/extract`)"
+      - "traefik.http.routers.extract.entrypoints=websecure"
+      - "traefik.http.routers.extract.tls=true"
+      - "traefik.http.services.extract.loadbalancer.server.port=8000"
 
   mongo:
     image: mongo:7-jammy
