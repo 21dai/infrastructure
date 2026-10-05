@@ -65,7 +65,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8000
-      DATABASE_URL: mongodb://admin:9009@mongo:27017/?authSource=admin
+      # Credenciales desde .env (12-Factor III). Si la clave tiene caracteres
+      # especiales (@ : / ?) hay que escribirla URL-encoded en el .env.
+      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
       DATABASE_NAME: pdf_extract
       DATABASE_TIMEOUT_MS: 3000
       MAX_PDF_SIZE_BYTES: 10485760
@@ -102,27 +104,22 @@ services:
     restart: unless-stopped
 
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: "9009"
+      # Obligatorias: sin .env el stack no arranca, en vez de usar una clave
+      # escrita en el codigo. Ver .env.example.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?definir MONGO_ROOT_USERNAME en .env (ver .env.example)}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?definir MONGO_ROOT_PASSWORD en .env (ver .env.example)}
       MONGO_INITDB_DATABASE: pdf_extract
 
     volumes:
       - mongo_data:/data/db
 
     healthcheck:
+      # $$ escapa la interpolacion de compose: las variables las expande el
+      # shell dentro del contenedor, con las credenciales que ya tiene Mongo.
       test:
         [
-          "CMD",
-          "mongosh",
-          "--quiet",
-          "-u",
-          "admin",
-          "-p",
-          "9009",
-          "--authenticationDatabase",
-          "admin",
-          "--eval",
-          "db.adminCommand({ ping: 1 }).ok",
+          "CMD-SHELL",
+          'mongosh --quiet -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ ping: 1 }).ok"',
         ]
       interval: 5s
       timeout: 5s

@@ -89,6 +89,19 @@ la siguiente línea:
 127.0.0.1 orchestrator.proyecto.localhost
 ```
 
+## Variables de entorno
+
+Las credenciales de MongoDB no estan en el compose: se leen de un `.env`
+(ignorado por git). La primera vez, desde la carpeta `infrastructure`:
+
+```powershell
+copy .env.example .env
+```
+
+Sin `.env`, `docker compose` se niega a arrancar y dice que variable falta.
+Mongo crea el usuario solo al inicializar el volumen: si se cambia la clave,
+hay que recrearlo con `docker compose down -v` (borra los datos).
+
 ## Levantar la infraestructura
 
 Desde la carpeta `infrastructure`:
