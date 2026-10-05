@@ -99,6 +99,9 @@ copy .env.example .env
 ```
 
 Sin `.env`, `docker compose` se niega a arrancar y dice que variable falta.
+Tambien define los tags de las imagenes (`ORCHESTRATOR_TAG`,
+`PDF_EXTRACTEXT_TAG`): la version de cada servicio, que hay que subir en cada
+release para que cada imagen quede identificada en vez de pisar un `latest`.
 Mongo crea el usuario solo al inicializar el volumen: si se cambia la clave,
 hay que recrearlo con `docker compose down -v` (borra los datos).
 

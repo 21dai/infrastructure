@@ -28,6 +28,9 @@ services:
     build:
       context: ../orchestrator-service
       dockerfile: Dockerfile
+    # 12-Factor V: cada release es una imagen con su version, no un latest
+    # que se pisa en cada build.
+    image: orchestrator-service:${ORCHESTRATOR_TAG:?definir ORCHESTRATOR_TAG en .env (ver .env.example)}
 
     restart: unless-stopped
 
@@ -49,6 +52,7 @@ services:
     build:
       context: ../pdf-extractext
       dockerfile: docker/Dockerfile
+    image: pdf-extractext:${PDF_EXTRACTEXT_TAG:?definir PDF_EXTRACTEXT_TAG en .env (ver .env.example)}
 
     # Sin container_name: con un nombre fijo Docker no puede crear replicas.
     # El orquestador lo sigue encontrando por el nombre del servicio.
