@@ -57,6 +57,9 @@ services:
     # Sin container_name: con un nombre fijo Docker no puede crear replicas.
     # El orquestador lo sigue encontrando por el nombre del servicio.
     restart: unless-stopped
+    # Ante SIGTERM termina lo que tiene en cola (hasta 28 s de espera por
+    # request) antes de que Docker mande SIGKILL.
+    stop_grace_period: 35s
 
     deploy:
       # Maximo que permite la consigna del TP.
@@ -101,6 +104,11 @@ services:
       - "traefik.http.routers.extract.entrypoints=websecure"
       - "traefik.http.routers.extract.tls=true"
       - "traefik.http.services.extract.loadbalancer.server.port=8000"
+      # Si una replica se cae o se esta apagando, reintenta en otra. Solo en
+      # /extract, que no guarda nada; el CRUD no se reintenta.
+      - "traefik.http.middlewares.extract-reintento.retry.attempts=3"
+      - "traefik.http.middlewares.extract-reintento.retry.initialinterval=100ms"
+      - "traefik.http.routers.extract.middlewares=extract-reintento"
 
   mongo:
     image: mongo:7-jammy
