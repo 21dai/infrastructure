@@ -83,18 +83,25 @@ services:
       mongo:
         condition: service_healthy
 
+    # Chequeo liviano: python sin site ni imports pesados (-S -I) y un socket
+    # en lugar de urllib, que carga ssl y email. Medido en reposo: urllib cada
+    # 5 s gastaba 12 % de un nucleo por replica; asi, cada 10 s, ~3 %. Al
+    # arrancar chequea cada 1 s para volver rapido al balanceo.
     healthcheck:
       test:
         [
           "CMD",
           "python",
+          "-S",
+          "-I",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
         ]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
       start_period: 10s
+      start_interval: 1s
 
     labels:
       # POST /extract directo desde Traefik, sin pasar por el orquestador:
