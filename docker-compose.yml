@@ -76,19 +76,13 @@ services:
           cpus: "1.0"
           memory: 1G
 
+    # Desde la 2.0.0 no usa base de datos (ADR-0008 de pdf-extractext): solo
+    # extrae. Por eso no recibe DATABASE_* ni depende de mongo: arranca sin
+    # esperarlo y una caida de MongoDB no lo afecta.
     environment:
       HOST: 0.0.0.0
       PORT: 8000
-      # Credenciales desde .env (12-Factor III). Si la clave tiene caracteres
-      # especiales (@ : / ?) hay que escribirla URL-encoded en el .env.
-      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
-      DATABASE_NAME: pdf_extract
-      DATABASE_TIMEOUT_MS: 3000
       MAX_PDF_SIZE_BYTES: 10485760
-
-    depends_on:
-      mongo:
-        condition: service_healthy
 
     # Chequeo liviano: python sin site ni imports pesados (-S -I) y un socket
     # en lugar de urllib, que carga ssl y email. Medido en reposo: urllib cada
@@ -118,8 +112,10 @@ services:
       - "traefik.http.routers.extract.entrypoints=websecure"
       - "traefik.http.routers.extract.tls=true"
       - "traefik.http.services.extract.loadbalancer.server.port=8000"
-      # Si una replica se cae o se esta apagando, reintenta en otra. Solo en
-      # /extract, que no guarda nada; el CRUD no se reintenta.
+      # Si una replica se cae o se esta apagando, reintenta en otra. Es seguro
+      # porque /extract no guarda estado: procesar dos veces el mismo PDF no
+      # cambia nada. El orquestador, en cambio, no reintenta sus POST (podrian
+      # duplicar trabajo): solo reintenta fallos de conexion.
       - "traefik.http.middlewares.extract-reintento.retry.attempts=3"
       - "traefik.http.middlewares.extract-reintento.retry.initialinterval=100ms"
       - "traefik.http.routers.extract.middlewares=extract-reintento"
@@ -172,6 +168,8 @@ services:
     # Sin labels de Traefik: es interno, solo lo llama el orquestador por la
     # red de Compose (exposedbydefault=false ya lo deja fuera del proxy).
 
+  # Hoy lo usa solo document-store (base document_store). pdf-extractext ya
+  # no guarda nada desde su 2.0.0.
   mongo:
     image: mongo:7-jammy
     container_name: mongo
@@ -182,7 +180,9 @@ services:
       # escrita en el codigo. Ver .env.example.
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?definir MONGO_ROOT_USERNAME en .env (ver .env.example)}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?definir MONGO_ROOT_PASSWORD en .env (ver .env.example)}
-      MONGO_INITDB_DATABASE: pdf_extract
+      # Sin MONGO_INITDB_DATABASE: solo sirve para los scripts de
+      # /docker-entrypoint-initdb.d, y no hay ninguno. MongoDB crea la base
+      # document_store sola cuando document-store la usa.
 
     volumes:
       - mongo_data:/data/db
