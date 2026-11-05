@@ -114,6 +114,11 @@ hay que recrearlo con `docker compose down -v` (borra los datos).
 > copiar `.env.example`). Sin esa variable `docker compose` no arranca y
 > muestra `required variable DOCUMENT_STORE_TAG is missing a value`.
 
+> **Si ya tenías un `.env`**: cambiá `PDF_EXTRACTEXT_TAG` a `2.0.0` (o volvé a
+> copiar `.env.example`). Si queda en `1.4.0`, `docker compose` construye el
+> código de la 2.0.0 y lo etiqueta `pdf-extractext:1.4.0`, pisando la imagen
+> vieja con código nuevo.
+
 ## Levantar la infraestructura
 
 Desde la carpeta `infrastructure`:
@@ -126,9 +131,9 @@ Esto inicia:
 
 - Traefik
 - Orchestrator Service
-- PDF Extractext (5 réplicas, 1 CPU y 1 GB cada una)
+- PDF Extractext (5 réplicas, 1 CPU y 1 GB cada una, sin base de datos)
 - Document Store
-- MongoDB
+- MongoDB (la base de Document Store)
 
 `docker-compose.override.yml` se aplica solo y ajusta la concurrencia para las
 pruebas de carga (1 proceso de uvicorn por réplica, Bulkhead del orquestador en
@@ -147,8 +152,10 @@ mientras arranca, Traefik no tiene a dónde mandar el tráfico y responde 404.
 `container_name`, porque un nombre fijo impide crear réplicas. El orquestador
 lo sigue encontrando por el nombre del servicio (`http://pdf-extractext:8000`).
 
-Traefik expone **solo** `POST /extract`, directo a las réplicas y sin pasar por
-el orquestador; el CRUD de `pdf-extractext` sigue siendo interno:
+`pdf-extractext` solo expone `POST /extract`: desde la 2.0.0 ya no tiene CRUD
+ni base de datos (ADR-0008 de ese repo), así que arranca sin esperar a MongoDB
+y una caída de la base no lo afecta. Traefik lo publica directo a las
+réplicas, sin pasar por el orquestador:
 
 ```powershell
 curl.exe -k -X POST https://extract.proyecto.localhost/extract -H "Content-Type: application/pdf" --data-binary "@documento.pdf"
@@ -168,8 +175,8 @@ ya está guardado.
 - **Interno**: no tiene labels de Traefik ni puertos publicados. Solo lo llama
   el orquestador por la red de Compose (`http://document-store:8000`, variable
   `DOCUMENT_STORE_BASE_URL`).
-- **Mismo MongoDB** del stack, en su propia base `document_store` (colecciones
-  `documents` y `counters`), separada de `pdf_extract`.
+- **MongoDB** del stack, en la base `document_store` (colecciones `documents`
+  y `counters`). Es la única base del stack: ningún otro servicio usa MongoDB.
 - El orquestador espera a que esté `healthy` antes de arrancar. Su `/health`
   no consulta MongoDB: si la base no responde, el healthcheck sigue en verde y
   las altas fallan con `503`.
@@ -269,13 +276,13 @@ Cliente
 Traefik ──────── POST /extract ────────┐
    │                                   │
    ▼                                   ▼
-Orchestrator Service ──────▶ PDF Extractext (x5)
-   │                                   │
-   ▼                                   │
-Document Store                         │
-   │  base document_store              │  base pdf_extract
-   ▼                                   ▼
-MongoDB ◀──────────────────────────────┘
+Orchestrator Service ──────▶ PDF Extractext (x5, sin base)
+   │
+   ▼
+Document Store
+   │  base document_store
+   ▼
+MongoDB
 ```
 
 Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator y, para `POST /extract`, entre las réplicas de PDF Extractext.
@@ -291,8 +298,22 @@ no está expuesto en Traefik.
 docker compose down
 ```
 
-Los datos de MongoDB (las bases `pdf_extract` y `document_store`) se mantienen
+Los datos de MongoDB (la base `document_store`, de Document Store) se mantienen
 en el volumen `mongo_data`.
+
+> **Opcional, en volúmenes viejos:** si el volumen viene de antes de
+> pdf-extractext 2.0.0, puede quedar la base `pdf_extract` con los documentos
+> del CRUD anterior. Ya no la usa nadie y no molesta. Para verla:
+>
+> ```powershell
+> docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getMongo().getDBNames()"
+> ```
+>
+> Para borrarla (**borra esos datos** y no se puede deshacer):
+>
+> ```powershell
+> docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getSiblingDB('pdf_extract').dropDatabase()"
+> ```
 
 Para eliminar también el volumen:
 
