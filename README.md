@@ -12,6 +12,7 @@ Los repositorios deben estar ubicados como carpetas hermanas:
 Proyecto/
 ├── orchestrator-service/
 ├── pdf-extractext/
+├── document-store/
 └── infrastructure/
 ```
 
@@ -26,6 +27,8 @@ infrastructure/
 ├── config/
 │   └── tls.yml
 ├── docker-compose.yml
+├── docker-compose.override.yml
+├── .env.example
 ├── .gitignore
 └── README.md
 ```
@@ -42,6 +45,7 @@ También deben estar clonados los repositorios:
 
 - `orchestrator-service`
 - `pdf-extractext`
+- `document-store`
 
 ## Certificados TLS
 
@@ -100,10 +104,15 @@ copy .env.example .env
 
 Sin `.env`, `docker compose` se niega a arrancar y dice que variable falta.
 Tambien define los tags de las imagenes (`ORCHESTRATOR_TAG`,
-`PDF_EXTRACTEXT_TAG`): la version de cada servicio, que hay que subir en cada
-release para que cada imagen quede identificada en vez de pisar un `latest`.
+`PDF_EXTRACTEXT_TAG`, `DOCUMENT_STORE_TAG`): la version de cada servicio, que
+hay que subir en cada release para que cada imagen quede identificada en vez de
+pisar un `latest`.
 Mongo crea el usuario solo al inicializar el volumen: si se cambia la clave,
 hay que recrearlo con `docker compose down -v` (borra los datos).
+
+> **Si ya tenías un `.env`**: agregale `DOCUMENT_STORE_TAG=0.1.0` (o volvé a
+> copiar `.env.example`). Sin esa variable `docker compose` no arranca y
+> muestra `required variable DOCUMENT_STORE_TAG is missing a value`.
 
 ## Levantar la infraestructura
 
@@ -118,6 +127,7 @@ Esto inicia:
 - Traefik
 - Orchestrator Service
 - PDF Extractext (5 réplicas, 1 CPU y 1 GB cada una)
+- Document Store
 - MongoDB
 
 `docker-compose.override.yml` se aplica solo y ajusta la concurrencia para las
@@ -147,6 +157,54 @@ curl.exe -k -X POST https://extract.proyecto.localhost/extract -H "Content-Type:
 Devuelve `{"content": "<Markdown>", "page_count": N}`. El contrato y las
 pruebas de carga están en el repo `pdf-extractext` (`README.md` y
 `tests/stress/`).
+
+## Document Store
+
+`document-store` guarda los documentos procesados. El orquestador le manda el
+texto extraído, la cantidad de páginas y el SHA-256 que calcula del PDF
+(ADR-0003 de `orchestrator-service`). Responde `201`, o `409` si ese checksum
+ya está guardado.
+
+- **Interno**: no tiene labels de Traefik ni puertos publicados. Solo lo llama
+  el orquestador por la red de Compose (`http://document-store:8000`, variable
+  `DOCUMENT_STORE_BASE_URL`).
+- **Mismo MongoDB** del stack, en su propia base `document_store` (colecciones
+  `documents` y `counters`), separada de `pdf_extract`.
+- El orquestador espera a que esté `healthy` antes de arrancar. Su `/health`
+  no consulta MongoDB: si la base no responde, el healthcheck sigue en verde y
+  las altas fallan con `503`.
+
+## Probar el flujo completo con un PDF
+
+Con todo en `healthy`, desde la carpeta donde está el PDF:
+
+```powershell
+curl.exe -k -F "file=@documento.pdf" https://orchestrator.proyecto.localhost/api/v1/documents
+```
+
+Responde `201` con el `document_id`, el `checksum` y el texto extraído. Para
+ponerle otro nombre, agregar `-F "name=Mi documento"`.
+
+Si se sube el mismo PDF otra vez, responde `409` (Problem Details) porque el
+checksum ya existe:
+
+```powershell
+curl.exe -k -i -F "file=@documento.pdf" https://orchestrator.proyecto.localhost/api/v1/documents
+```
+
+Para ver lo guardado en MongoDB (usuario y clave del `.env`):
+
+```powershell
+docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getSiblingDB('document_store').documents.find({}, { extracted_text: 0 }).toArray()"
+```
+
+Con `document-store` detenido, el alta responde `503` y el detalle lo nombra:
+
+```powershell
+docker compose stop document-store
+curl.exe -k -i -F "file=@otro.pdf" https://orchestrator.proyecto.localhost/api/v1/documents
+docker compose start document-store
+```
 
 ## Levantar varias réplicas del Orchestrator
 
@@ -212,14 +270,20 @@ Traefik ──────── POST /extract ────────┐
    │                                   │
    ▼                                   ▼
 Orchestrator Service ──────▶ PDF Extractext (x5)
-                                       │
-                                       ▼
-                                    MongoDB
+   │                                   │
+   ▼                                   │
+Document Store                         │
+   │  base document_store              │  base pdf_extract
+   ▼                                   ▼
+MongoDB ◀──────────────────────────────┘
 ```
 
 Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator y, para `POST /extract`, entre las réplicas de PDF Extractext.
 
-El Orchestrator se comunica internamente con `pdf-extractext` mediante la red de Docker Compose.
+El Orchestrator se comunica internamente con `pdf-extractext` (extrae el texto
+con `POST /extract`) y con `document-store` (guarda el documento con
+`POST /api/v1/documents`) mediante la red de Docker Compose. `document-store`
+no está expuesto en Traefik.
 
 ## Detener la infraestructura
 
@@ -227,7 +291,8 @@ El Orchestrator se comunica internamente con `pdf-extractext` mediante la red de
 docker compose down
 ```
 
-Los datos de MongoDB se mantienen en el volumen `mongo_data`.
+Los datos de MongoDB (las bases `pdf_extract` y `document_store`) se mantienen
+en el volumen `mongo_data`.
 
 Para eliminar también el volumen:
 
