@@ -36,9 +36,16 @@ services:
 
     environment:
       PDF_EXTRACT_BASE_URL: http://pdf-extractext:8000
+      # Sin esto usa el default local (http://localhost:8002): dentro del
+      # contenedor no escucha nadie ahi y todo upload terminaria en 503.
+      DOCUMENT_STORE_BASE_URL: http://document-store:8000
 
+    # Extrae con pdf-extractext y guarda con document-store (ADR-0003 del
+    # orquestador): sin alguno de los dos, cada upload falla.
     depends_on:
       pdf-extractext:
+        condition: service_healthy
+      document-store:
         condition: service_healthy
 
     labels:
@@ -116,6 +123,54 @@ services:
       - "traefik.http.middlewares.extract-reintento.retry.attempts=3"
       - "traefik.http.middlewares.extract-reintento.retry.initialinterval=100ms"
       - "traefik.http.routers.extract.middlewares=extract-reintento"
+
+  document-store:
+    build:
+      context: ../document-store
+      dockerfile: Dockerfile
+    image: document-store:${DOCUMENT_STORE_TAG:?definir DOCUMENT_STORE_TAG en .env (ver .env.example)}
+
+    # Sin container_name, igual que pdf-extractext: deja escalarlo con
+    # --scale y el orquestador lo encuentra por el nombre del servicio.
+    restart: unless-stopped
+
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      # Mismo MongoDB del stack, con su propia base: los documentos guardados
+      # no se mezclan con los de pdf_extract. Credenciales desde .env
+      # (12-Factor III); si la clave tiene @ : / ? va URL-encoded.
+      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      DATABASE_NAME: document_store
+      DATABASE_TIMEOUT_MS: 3000
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+    # Reemplaza el HEALTHCHECK del Dockerfile (urllib cada 30 s): el
+    # orquestador espera a que este healthy, y con 30 s de intervalo tardaria
+    # medio minuto en arrancar. Mismo chequeo liviano que pdf-extractext
+    # (socket, sin cargar ssl ni email) y cada 1 s mientras arranca.
+    # /health no toca MongoDB: solo dice que el proceso responde.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-S",
+          "-I",
+          "-c",
+          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
+
+    # Sin labels de Traefik: es interno, solo lo llama el orquestador por la
+    # red de Compose (exposedbydefault=false ya lo deja fuera del proxy).
 
   mongo:
     image: mongo:7-jammy
