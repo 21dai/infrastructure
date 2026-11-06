@@ -231,11 +231,15 @@ docker compose ps orchestrator
 
 ## Traefik Dashboard
 
-El dashboard local está disponible en:
+El dashboard local está disponible **solo desde la máquina anfitriona** en:
 
 ```text
 http://localhost:8080/dashboard/
 ```
+
+El puerto 8080 está publicado únicamente en `127.0.0.1` (localhost), no en todas las interfaces (`0.0.0.0`). Esto evita la exposición del dashboard administrativo y la API insegura de Traefik a la red, cumpliendo con los criterios de seguridad de la issue #3.
+
+Para acceder desde otra máquina en la red local, se requiere un túnel SSH o configurar autenticación/TLS en Traefik (fuera del alcance de esta mitigación).
 
 ## Probar el Orchestrator
 
