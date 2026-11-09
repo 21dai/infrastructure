@@ -125,6 +125,13 @@ antes del primer `up` por una propia, por ejemplo generada en PowerShell con
 escaparla en la URL de conexión). La clave nunca va en los comandos ni en el
 repo: los comandos de `mongosh` de este README la toman del contenedor.
 
+> Los comandos con `--eval` están escritos para PowerShell (también el 5.1 de
+> Windows): comillas dobles de PowerShell, `` `$ `` para que la variable la
+> expanda el `sh` del contenedor, y el JavaScript entre comillas simples **sin
+> strings adentro** (los valores van por `-e` y `process.env`). Windows
+> PowerShell 5.1 borra las comillas dobles internas al llamar a `docker`, así
+> que un `--eval "db.getSiblingDB(\"x\")"` falla con `Syntax error`.
+
 ### Cambiar la clave de MongoDB
 
 Mongo crea el usuario solo al inicializar el volumen: cambiar `.env` no cambia
@@ -133,7 +140,7 @@ con el stack levantado y todavía con la clave vieja en `.env`:
 
 ```powershell
 $nueva = [guid]::NewGuid().ToString("N")
-docker compose exec mongo sh -c "mongosh --quiet -u `"`$MONGO_INITDB_ROOT_USERNAME`" -p `"`$MONGO_INITDB_ROOT_PASSWORD`" --authenticationDatabase admin --eval 'db.getSiblingDB(`"admin`").changeUserPassword(`"admin`", `"$nueva`")'"
+docker compose exec -e NUEVA_CLAVE=$nueva mongo sh -c "mongosh --quiet -u `$MONGO_INITDB_ROOT_USERNAME -p `$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin admin --eval 'db.changeUserPassword(process.env.MONGO_INITDB_ROOT_USERNAME, process.env.NUEVA_CLAVE)'"
 $nueva   # copiarla en MONGO_ROOT_PASSWORD del .env
 docker compose up -d   # recrea mongo y document-store con la clave nueva
 ```
@@ -148,7 +155,7 @@ volumen creado con `mongo:7-jammy` arranca con la 8.0 sin cambios: MongoDB
 soporta subir de a una versión mayor. Antes conviene hacer un respaldo:
 
 ```powershell
-docker compose exec mongo sh -c 'mongodump --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --gzip --archive=/tmp/respaldo.archive.gz'
+docker compose exec mongo sh -c "mongodump --quiet -u `$MONGO_INITDB_ROOT_USERNAME -p `$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --gzip --archive=/tmp/respaldo.archive.gz"
 docker cp mongo:/tmp/respaldo.archive.gz .\respaldo-mongo.archive.gz
 ```
 
@@ -157,7 +164,7 @@ la 7.0 si algo falla. Cuando todo funcione, se puede pasar a 8.0 (ya no se
 puede volver atrás):
 
 ```powershell
-docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ setFeatureCompatibilityVersion: \"8.0\", confirm: true })"'
+docker compose exec -e FCV=8.0 mongo sh -c "mongosh --quiet -u `$MONGO_INITDB_ROOT_USERNAME -p `$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ setFeatureCompatibilityVersion: process.env.FCV, confirm: true })'"
 ```
 
 > **Si ya tenías un `.env`**: cambiá los tags a `ORCHESTRATOR_TAG=0.2.0`,
@@ -451,13 +458,13 @@ en el volumen `mongo_data`.
 > del CRUD anterior. Ya no la usa nadie y no molesta. Para verla:
 >
 > ```powershell
-> docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.getMongo().getDBNames()"'
+> docker compose exec mongo sh -c "mongosh --quiet -u `$MONGO_INITDB_ROOT_USERNAME -p `$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.getMongo().getDBNames()'"
 > ```
 >
 > Para borrarla (**borra esos datos** y no se puede deshacer):
 >
 > ```powershell
-> docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.getSiblingDB(\"pdf_extract\").dropDatabase()"'
+> docker compose exec mongo sh -c "mongosh --quiet -u `$MONGO_INITDB_ROOT_USERNAME -p `$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin pdf_extract --eval 'db.dropDatabase()'"
 > ```
 
 Para eliminar también el volumen:
