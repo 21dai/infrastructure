@@ -119,8 +119,46 @@ Tambien define los tags de las imagenes (`ORCHESTRATOR_TAG`,
 `PDF_EXTRACTEXT_TAG`, `DOCUMENT_STORE_TAG`): la version de cada servicio, que
 hay que subir en cada release para que cada imagen quede identificada en vez de
 pisar un `latest`.
-Mongo crea el usuario solo al inicializar el volumen: si se cambia la clave,
-hay que recrearlo con `docker compose down -v` (borra los datos).
+`.env.example` trae `MONGO_ROOT_PASSWORD=cambiar-esta-clave`: reemplazarla
+antes del primer `up` por una propia, por ejemplo generada en PowerShell con
+`[guid]::NewGuid().ToString("N")` (32 caracteres hexadecimales, no hace falta
+escaparla en la URL de conexión). La clave nunca va en los comandos ni en el
+repo: los comandos de `mongosh` de este README la toman del contenedor.
+
+### Cambiar la clave de MongoDB
+
+Mongo crea el usuario solo al inicializar el volumen: cambiar `.env` no cambia
+la clave de un volumen que ya existe. Para cambiarla **sin borrar los datos**,
+con el stack levantado y todavía con la clave vieja en `.env`:
+
+```powershell
+$nueva = [guid]::NewGuid().ToString("N")
+docker compose exec mongo sh -c "mongosh --quiet -u `"`$MONGO_INITDB_ROOT_USERNAME`" -p `"`$MONGO_INITDB_ROOT_PASSWORD`" --authenticationDatabase admin --eval 'db.getSiblingDB(`"admin`").changeUserPassword(`"admin`", `"$nueva`")'"
+$nueva   # copiarla en MONGO_ROOT_PASSWORD del .env
+docker compose up -d   # recrea mongo y document-store con la clave nueva
+```
+
+La otra opción es `docker compose down -v`, que **borra los datos**. Coordinar
+el cambio con el grupo: cada uno tiene su propio volumen y su propio `.env`.
+
+### Actualizar MongoDB
+
+El stack usa `mongo:8.0.34` (tag completo: la misma imagen en cada build). Un
+volumen creado con `mongo:7-jammy` arranca con la 8.0 sin cambios: MongoDB
+soporta subir de a una versión mayor. Antes conviene hacer un respaldo:
+
+```powershell
+docker compose exec mongo sh -c 'mongodump --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --gzip --archive=/tmp/respaldo.archive.gz'
+docker cp mongo:/tmp/respaldo.archive.gz .\respaldo-mongo.archive.gz
+```
+
+El volumen queda con `featureCompatibilityVersion` 7.0, lo que permite volver a
+la 7.0 si algo falla. Cuando todo funcione, se puede pasar a 8.0 (ya no se
+puede volver atrás):
+
+```powershell
+docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ setFeatureCompatibilityVersion: \"8.0\", confirm: true })"'
+```
 
 > **Si ya tenías un `.env`**: cambiá los tags a `ORCHESTRATOR_TAG=0.2.0`,
 > `DOCUMENT_STORE_TAG=0.2.0` y `PDF_EXTRACTEXT_TAG=2.0.1` (o volvé a copiar
@@ -254,10 +292,14 @@ checksum ya existe:
 curl.exe -k -i -F "file=@documento.pdf" https://orchestrator.proyecto.localhost/api/v1/documents
 ```
 
-Para ver lo guardado en MongoDB (usuario y clave del `.env`):
+Para ver lo guardado en MongoDB, sin escribir la clave: el contenedor ya tiene
+el usuario y la clave del `.env` en `MONGO_INITDB_ROOT_USERNAME` y
+`MONGO_INITDB_ROOT_PASSWORD`.
 
 ```powershell
-docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getSiblingDB('document_store').documents.find({}, { extracted_text: 0 }).toArray()"
+docker compose exec mongo sh -c 'mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin document_store'
+# dentro de mongosh:
+db.documents.find({}, { extracted_text: 0 })
 ```
 
 Con `document-store` detenido, el alta responde `503` y el detalle lo nombra:
@@ -309,6 +351,17 @@ Traefik detecta automáticamente las réplicas y distribuye las solicitudes entr
 
 ```powershell
 docker compose ps orchestrator
+```
+
+## HTTP redirige a HTTPS
+
+Ningún router escucha en el puerto 80: Traefik redirige todo lo que llega por
+HTTP a HTTPS (`308 Permanent Redirect`).
+
+```powershell
+curl.exe -I http://orchestrator.proyecto.localhost/health
+# HTTP/1.1 308 Permanent Redirect
+# Location: https://orchestrator.proyecto.localhost/health
 ```
 
 ## Traefik Dashboard
@@ -398,13 +451,13 @@ en el volumen `mongo_data`.
 > del CRUD anterior. Ya no la usa nadie y no molesta. Para verla:
 >
 > ```powershell
-> docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getMongo().getDBNames()"
+> docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.getMongo().getDBNames()"'
 > ```
 >
 > Para borrarla (**borra esos datos** y no se puede deshacer):
 >
 > ```powershell
-> docker compose exec mongo mongosh -u admin -p 9009 --authenticationDatabase admin --eval "db.getSiblingDB('pdf_extract').dropDatabase()"
+> docker compose exec mongo sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.getSiblingDB(\"pdf_extract\").dropDatabase()"'
 > ```
 
 Para eliminar también el volumen:
