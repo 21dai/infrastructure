@@ -33,9 +33,17 @@ services:
     image: orchestrator-service:${ORCHESTRATOR_TAG:?definir ORCHESTRATOR_TAG en .env (ver .env.example)}
 
     restart: unless-stopped
+    # 12-Factor IX (apagado ordenado). Ante SIGTERM uvicorn deja de aceptar
+    # conexiones y espera las requests en curso hasta GRACEFUL_SHUTDOWN_SECONDS
+    # (60 s): lo mismo que puede tardar una request esperando a pdf-extractext
+    # (HTTP_TIMEOUT_SECONDS=60 en docker-compose.override.yml). Docker manda
+    # SIGKILL recien a los 70 s: 10 s de margen para cerrar el lifespan.
+    stop_grace_period: 70s
 
     environment:
       HOST: 0.0.0.0
+      # Menor que stop_grace_period (ver arriba).
+      GRACEFUL_SHUTDOWN_SECONDS: 60
       # Puerto del orquestador: lo usan uvicorn (main.py lee PORT), el
       # healthcheck y la label de Traefik. Una sola variable para los tres.
       PORT: ${ORCHESTRATOR_PORT:-8000}
@@ -171,9 +179,15 @@ services:
     # Sin container_name, igual que pdf-extractext: deja escalarlo con
     # --scale y el orquestador lo encuentra por el nombre del servicio.
     restart: unless-stopped
+    # 12-Factor IX. Requests cortas (consultas e inserts en MongoDB con timeout
+    # de 3 s): uvicorn espera hasta GRACEFUL_SHUTDOWN_SECONDS (10 s) y Docker
+    # manda SIGKILL recien a los 15 s, con margen para cerrar el cliente de Mongo.
+    stop_grace_period: 15s
 
     environment:
       HOST: 0.0.0.0
+      # Menor que stop_grace_period (ver arriba).
+      GRACEFUL_SHUTDOWN_SECONDS: 10
       # Mismo valor para PORT, el healthcheck y la URL que usa el orquestador.
       PORT: ${DOCUMENT_STORE_PORT:-8000}
       # Mismo MongoDB del stack, con su propia base: los documentos guardados
