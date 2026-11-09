@@ -40,12 +40,14 @@ services:
       # contenedor no escucha nadie ahi y todo upload terminaria en 503.
       DOCUMENT_STORE_BASE_URL: http://document-store:8000
 
-    # Extrae con pdf-extractext y guarda con document-store (ADR-0003 del
-    # orquestador): sin alguno de los dos, cada upload falla.
+    # Orden de arranque: mongo -> document-store -> pdf-extractext ->
+    # orchestrator. El orquestador es el ultimo: extrae con pdf-extractext y
+    # guarda con document-store (ADR-0003 del orquestador), asi que sin alguno
+    # de los dos cada upload falla.
     depends_on:
-      pdf-extractext:
-        condition: service_healthy
       document-store:
+        condition: service_healthy
+      pdf-extractext:
         condition: service_healthy
 
     labels:
@@ -76,9 +78,16 @@ services:
           cpus: "1.0"
           memory: 1G
 
+    # Orden de arranque que pidio la catedra: documentos, extraccion y por
+    # ultimo el orquestador. pdf-extractext NO necesita a document-store para
+    # funcionar (no lo llama nunca): esperarlo es solo el orden de arranque.
+    # Una caida posterior de document-store o de MongoDB no lo afecta.
+    depends_on:
+      document-store:
+        condition: service_healthy
+
     # Desde la 2.0.0 no usa base de datos (ADR-0008 de pdf-extractext): solo
-    # extrae. Por eso no recibe DATABASE_* ni depende de mongo: arranca sin
-    # esperarlo y una caida de MongoDB no lo afecta.
+    # extrae. Por eso no recibe DATABASE_*.
     environment:
       HOST: 0.0.0.0
       PORT: 8000
