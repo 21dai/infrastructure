@@ -44,6 +44,11 @@ services:
       # Sin esto usa el default local (http://localhost:8002): dentro del
       # contenedor no escucha nadie ahi y todo upload terminaria en 503.
       DOCUMENT_STORE_BASE_URL: http://document-store:${DOCUMENT_STORE_PORT:-8000}
+      # Traefik termina TLS y manda X-Forwarded-Proto/For: el orquestador solo
+      # los acepta de la red del stack (misma subred que networks.default), no
+      # de cualquier origen. Sin esto usa 127.0.0.1 y las URLs que arma (p. ej.
+      # "instance" de los Problem Details) salen con http:// en vez de https://.
+      FORWARDED_ALLOW_IPS: ${STACK_SUBNET:-172.28.0.0/16}
 
     # Orden de arranque: mongo -> document-store -> pdf-extractext ->
     # orchestrator. El orquestador es el ultimo: extrae con pdf-extractext y
@@ -243,3 +248,14 @@ services:
 
 volumes:
   mongo_data:
+
+# Red del stack con subred fija: el orquestador solo confia en los headers
+# X-Forwarded-* que vienen de esta red (Traefik), ver FORWARDED_ALLOW_IPS.
+# 172.28.0.0/16 no choca con las redes que crea Docker por defecto
+# (172.17-172.2x); si choca con otra red de la maquina, cambiar STACK_SUBNET
+# en .env (y hacer docker compose down para recrear la red).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${STACK_SUBNET:-172.28.0.0/16}
