@@ -13,6 +13,10 @@ services:
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      # Ningun router escucha en web (:80): todo lo que llega por HTTP se
+      # redirige a HTTPS en vez de responder 404.
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
 
     ports:
       - "80:80"
