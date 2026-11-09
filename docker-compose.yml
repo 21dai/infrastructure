@@ -235,7 +235,10 @@ services:
   # Hoy lo usa solo document-store (base document_store). pdf-extractext ya
   # no guarda nada desde su 2.0.0.
   mongo:
-    image: mongo:7-jammy
+    # Version completa (no un tag flotante como 7-jammy): la misma imagen en
+    # cada build. 8.0 es la rama de soporte largo y el salto desde un volumen
+    # 7.0 esta soportado (ver "Actualizar MongoDB" en el README).
+    image: mongo:8.0.34
     container_name: mongo
     restart: unless-stopped
 
