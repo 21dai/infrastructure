@@ -268,6 +268,33 @@ curl.exe -k -i -F "file=@otro.pdf" https://orchestrator.proyecto.localhost/api/v
 docker compose start document-store
 ```
 
+## Apagado ordenado (12-Factor IX)
+
+Ante `docker compose stop`, `down`, un `--scale` hacia abajo o un redeploy,
+Docker manda `SIGTERM` y espera `stop_grace_period` antes de matar el proceso
+con `SIGKILL`. uvicorn es el PID 1 de cada contenedor (`CMD ["python",
+"main.py"]`): al recibir la señal deja de aceptar conexiones, espera las
+requests en curso hasta `GRACEFUL_SHUTDOWN_SECONDS` y ejecuta el cierre del
+`lifespan` (el orquestador cierra sus clients httpx; document-store, el cliente
+de MongoDB).
+
+| Servicio | `GRACEFUL_SHUTDOWN_SECONDS` | `stop_grace_period` | Por qué |
+|---|---|---|---|
+| orchestrator | 60 | 70s | Una request puede esperar a pdf-extractext hasta 60 s (`HTTP_TIMEOUT_SECONDS` del override) |
+| document-store | 10 | 15s | Consultas e inserts cortos (timeout de MongoDB de 3 s) |
+| pdf-extractext | — | 35s | Termina su cola: hasta 25 s por request (`EXTRACT_MAX_WAIT_SECONDS`) |
+
+En cada servicio la espera de uvicorn es **menor** que la de Docker, así el
+cierre termina antes del `SIGKILL`.
+
+Cómo se probó: mientras se sube un PDF grande, en otra terminal
+`docker compose stop orchestrator`. La subida termina con su `201` y los logs
+muestran el cierre ordenado:
+
+```powershell
+docker compose logs orchestrator | Select-String "Shutting down|Waiting for application shutdown|Application shutdown complete"
+```
+
 ## Levantar varias réplicas del Orchestrator
 
 Para ejecutar tres instancias:
