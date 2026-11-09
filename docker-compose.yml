@@ -35,10 +35,15 @@ services:
     restart: unless-stopped
 
     environment:
-      PDF_EXTRACT_BASE_URL: http://pdf-extractext:8000
+      HOST: 0.0.0.0
+      # Puerto del orquestador: lo usan uvicorn (main.py lee PORT), el
+      # healthcheck y la label de Traefik. Una sola variable para los tres.
+      PORT: ${ORCHESTRATOR_PORT:-8000}
+      # Cada URL usa el mismo puerto que el servicio al que apunta.
+      PDF_EXTRACT_BASE_URL: http://pdf-extractext:${PDF_EXTRACTEXT_PORT:-8000}
       # Sin esto usa el default local (http://localhost:8002): dentro del
       # contenedor no escucha nadie ahi y todo upload terminaria en 503.
-      DOCUMENT_STORE_BASE_URL: http://document-store:8000
+      DOCUMENT_STORE_BASE_URL: http://document-store:${DOCUMENT_STORE_PORT:-8000}
 
     # Orden de arranque: mongo -> document-store -> pdf-extractext ->
     # orchestrator. El orquestador es el ultimo: extrae con pdf-extractext y
@@ -50,12 +55,32 @@ services:
       pdf-extractext:
         condition: service_healthy
 
+    # Reemplaza el HEALTHCHECK del Dockerfile del orquestador: mismo chequeo
+    # liviano que los demas servicios (socket, sin cargar ssl ni email) y cada
+    # 1 s mientras arranca, para que Traefik le mande trafico enseguida
+    # (Traefik ignora los contenedores que todavia no estan healthy).
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-S",
+          "-I",
+          "-c",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
+
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.orchestrator.rule=Host(`orchestrator.proyecto.localhost`)"
       - "traefik.http.routers.orchestrator.entrypoints=websecure"
       - "traefik.http.routers.orchestrator.tls=true"
-      - "traefik.http.services.orchestrator.loadbalancer.server.port=8000"
+      - "traefik.http.services.orchestrator.loadbalancer.server.port=${ORCHESTRATOR_PORT:-8000}"
 
   pdf-extractext:
     build:
@@ -90,13 +115,16 @@ services:
     # extrae. Por eso no recibe DATABASE_*.
     environment:
       HOST: 0.0.0.0
-      PORT: 8000
+      # Mismo valor para PORT, el healthcheck, la label de Traefik y la URL
+      # que usa el orquestador.
+      PORT: ${PDF_EXTRACTEXT_PORT:-8000}
       MAX_PDF_SIZE_BYTES: 10485760
 
     # Chequeo liviano: python sin site ni imports pesados (-S -I) y un socket
     # en lugar de urllib, que carga ssl y email. Medido en reposo: urllib cada
     # 5 s gastaba 12 % de un nucleo por replica; asi, cada 10 s, ~3 %. Al
-    # arrancar chequea cada 1 s para volver rapido al balanceo.
+    # arrancar chequea cada 1 s para volver rapido al balanceo. El puerto sale
+    # de PORT (os es un modulo congelado: no cambia el costo del chequeo).
     healthcheck:
       test:
         [
@@ -105,7 +133,7 @@ services:
           "-S",
           "-I",
           "-c",
-          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
         ]
       interval: 10s
       timeout: 5s
@@ -120,7 +148,7 @@ services:
       - "traefik.http.routers.extract.rule=Host(`extract.proyecto.localhost`) && PathPrefix(`/extract`)"
       - "traefik.http.routers.extract.entrypoints=websecure"
       - "traefik.http.routers.extract.tls=true"
-      - "traefik.http.services.extract.loadbalancer.server.port=8000"
+      - "traefik.http.services.extract.loadbalancer.server.port=${PDF_EXTRACTEXT_PORT:-8000}"
       # Si una replica se cae o se esta apagando, reintenta en otra. Es seguro
       # porque /extract no guarda estado: procesar dos veces el mismo PDF no
       # cambia nada. El orquestador, en cambio, no reintenta sus POST (podrian
@@ -141,7 +169,8 @@ services:
 
     environment:
       HOST: 0.0.0.0
-      PORT: 8000
+      # Mismo valor para PORT, el healthcheck y la URL que usa el orquestador.
+      PORT: ${DOCUMENT_STORE_PORT:-8000}
       # Mismo MongoDB del stack, con su propia base: los documentos guardados
       # no se mezclan con los de pdf_extract. Credenciales desde .env
       # (12-Factor III); si la clave tiene @ : / ? va URL-encoded.
@@ -153,11 +182,14 @@ services:
       mongo:
         condition: service_healthy
 
-    # Reemplaza el HEALTHCHECK del Dockerfile (urllib cada 30 s): el
-    # orquestador espera a que este healthy, y con 30 s de intervalo tardaria
-    # medio minuto en arrancar. Mismo chequeo liviano que pdf-extractext
+    # Reemplaza el HEALTHCHECK del Dockerfile (urllib cada 30 s): pdf-extractext
+    # y el orquestador esperan a que este healthy, y con 30 s de intervalo
+    # tardarian medio minuto en arrancar. Mismo chequeo liviano que los demas
     # (socket, sin cargar ssl ni email) y cada 1 s mientras arranca.
-    # /health no toca MongoDB: solo dice que el proceso responde.
+    # Usa /ready (readiness): hace ping a MongoDB y responde 503 si la base no
+    # contesta, asi que con Mongo caido document-store pasa a unhealthy y
+    # Traefik/compose lo ven. El ping falla en DATABASE_TIMEOUT_MS (3 s), menos
+    # que el timeout del chequeo (5 s). /health (liveness) no toca la base.
     healthcheck:
       test:
         [
@@ -166,7 +198,7 @@ services:
           "-S",
           "-I",
           "-c",
-          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /ready HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
         ]
       interval: 10s
       timeout: 5s
