@@ -103,12 +103,32 @@ copy .env.example .env
 ```
 
 Sin `.env`, `docker compose` se niega a arrancar y dice que variable falta.
+
+Variables opcionales (si no se definen, se usan los valores por defecto):
+
+| Variable | Default | Para qué |
+|---|---|---|
+| `ORCHESTRATOR_PORT` | `8000` | Puerto del orquestador: `PORT`, su healthcheck y la label de Traefik |
+| `PDF_EXTRACTEXT_PORT` | `8000` | Puerto de pdf-extractext: `PORT`, healthcheck, label de Traefik y la URL que usa el orquestador |
+| `DOCUMENT_STORE_PORT` | `8000` | Puerto de document-store: `PORT`, healthcheck y la URL que usa el orquestador |
+| `STACK_SUBNET` | `172.28.0.0/16` | Subred de la red del stack. El orquestador solo acepta `X-Forwarded-*` de esta red (`FORWARDED_ALLOW_IPS`). Cambiarla solo si choca con otra red de la máquina (`docker network inspect`) |
+
+Cada puerto sale de **una sola variable** (12-Factor VII): no hay ningún `8000`
+escrito salvo como valor por defecto.
 Tambien define los tags de las imagenes (`ORCHESTRATOR_TAG`,
 `PDF_EXTRACTEXT_TAG`, `DOCUMENT_STORE_TAG`): la version de cada servicio, que
 hay que subir en cada release para que cada imagen quede identificada en vez de
 pisar un `latest`.
 Mongo crea el usuario solo al inicializar el volumen: si se cambia la clave,
 hay que recrearlo con `docker compose down -v` (borra los datos).
+
+> **Si ya tenías un `.env`**: cambiá los tags a `ORCHESTRATOR_TAG=0.2.0`,
+> `DOCUMENT_STORE_TAG=0.2.0` y `PDF_EXTRACTEXT_TAG=2.0.1` (o volvé a copiar
+> `.env.example`, conservando tu clave de MongoDB). Si quedan los viejos,
+> `docker compose up --build` construye el código nuevo con la etiqueta vieja y
+> pisa esa imagen. Además, la red del stack ahora tiene una subred fija: la
+> primera vez hacé `docker compose down` antes del `up`, o Compose no puede
+> recrear la red.
 
 > **Si ya tenías un `.env`**: agregale `DOCUMENT_STORE_TAG=0.1.0` (o volvé a
 > copiar `.env.example`). Sin esa variable `docker compose` no arranca y
@@ -146,6 +166,40 @@ docker compose -f docker-compose.yml up -d --build
 Esperar a que todo diga `healthy` en `docker compose ps` antes de probar:
 mientras arranca, Traefik no tiene a dónde mandar el tráfico y responde 404.
 
+### Orden de arranque y healthchecks
+
+Los servicios arrancan en el orden que pidió la cátedra, cada uno recién cuando
+el anterior está `healthy` (`depends_on` con `condition: service_healthy`):
+
+```text
+mongo → document-store → pdf-extractext → orchestrator
+```
+
+pdf-extractext no necesita a document-store para funcionar (no lo llama
+nunca): esperarlo es solo el orden de arranque. El orquestador sí necesita a
+los dos.
+
+| Servicio | Healthcheck | Qué verifica |
+|---|---|---|
+| mongo | `mongosh ... ping` | La base responde |
+| document-store | `GET /ready` | El proceso responde **y** MongoDB contesta el `ping` (503 si no) |
+| pdf-extractext | `GET /health` | El proceso responde (no depende de nadie) |
+| orchestrator | `GET /health` | El proceso responde |
+
+Los tres servicios Python usan el mismo chequeo liviano (`python -S -I` con un
+socket, sin cargar `urllib`), leen el puerto de `PORT` y chequean cada 10 s
+(cada 1 s mientras arrancan), así que todo queda `healthy` pocos segundos
+después del `up`. El del orquestador reemplaza al `HEALTHCHECK` de su
+Dockerfile.
+
+```powershell
+docker compose ps        # STATUS: (healthy) en los cuatro
+```
+
+Con MongoDB detenido, document-store pasa a `unhealthy` (su `/ready` responde
+503) y las altas responden 503 con Problem Details; al volver MongoDB, vuelve a
+`healthy` solo.
+
 ## PDF Extractext: réplicas y POST /extract
 
 `pdf-extractext` corre con 5 réplicas (el máximo del TP de carga) y sin
@@ -153,8 +207,8 @@ mientras arranca, Traefik no tiene a dónde mandar el tráfico y responde 404.
 lo sigue encontrando por el nombre del servicio (`http://pdf-extractext:8000`).
 
 `pdf-extractext` solo expone `POST /extract`: desde la 2.0.0 ya no tiene CRUD
-ni base de datos (ADR-0008 de ese repo), así que arranca sin esperar a MongoDB
-y una caída de la base no lo afecta. Traefik lo publica directo a las
+ni base de datos (ADR-0008 de ese repo), así que una caída de MongoDB o de
+document-store no lo afecta (en el arranque los espera solo por el orden). Traefik lo publica directo a las
 réplicas, sin pasar por el orquestador:
 
 ```powershell
@@ -177,9 +231,10 @@ ya está guardado.
   `DOCUMENT_STORE_BASE_URL`).
 - **MongoDB** del stack, en la base `document_store` (colecciones `documents`
   y `counters`). Es la única base del stack: ningún otro servicio usa MongoDB.
-- El orquestador espera a que esté `healthy` antes de arrancar. Su `/health`
-  no consulta MongoDB: si la base no responde, el healthcheck sigue en verde y
-  las altas fallan con `503`.
+- pdf-extractext y el orquestador esperan a que esté `healthy` antes de
+  arrancar. Su healthcheck usa `/ready`, que hace `ping` a MongoDB: si la base
+  no responde, pasa a `unhealthy` y las altas fallan con `503`. `/health` solo
+  dice que el proceso está vivo.
 
 ## Probar el flujo completo con un PDF
 
@@ -290,6 +345,12 @@ MongoDB
 ```
 
 Traefik funciona como punto de entrada al sistema y distribuye las solicitudes entre las réplicas disponibles del Orchestrator y, para `POST /extract`, entre las réplicas de PDF Extractext.
+
+Traefik termina TLS y le pasa al orquestador `X-Forwarded-Proto` y
+`X-Forwarded-For`. El orquestador solo los acepta de la red del stack
+(`FORWARDED_ALLOW_IPS` = `STACK_SUBNET`), así que las URLs que arma (por
+ejemplo `instance` en los errores) salen con `https://`, y un contenedor que le
+hable sin pasar por Traefik no puede falsear la IP ni el esquema del cliente.
 
 El Orchestrator se comunica internamente con `pdf-extractext` (extrae el texto
 con `POST /extract`) y con `document-store` (guarda el documento con
