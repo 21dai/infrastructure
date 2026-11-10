@@ -22,5 +22,3 @@ services:
       BULKHEAD_MAX_CONCURRENT: 5
       BULKHEAD_MAX_WAITING: 200
       BULKHEAD_ACQUIRE_TIMEOUT_SECONDS: 60
-      # Que el circuito no se abra por lentitud normal bajo carga.
-      CIRCUIT_BREAKER_FAILURE_THRESHOLD: 20
