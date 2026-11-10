@@ -17,6 +17,12 @@ services:
       # redirige a HTTPS en vez de responder 404.
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Entrypoint interno para el trafico entre servicios (orquestador ->
+      # pdf-extractext y orquestador -> document-store). NO va en ports: solo
+      # lo alcanzan los contenedores de la red del stack. Pasar por Traefik le
+      # da balanceo real entre replicas y el circuit breaker (ver las labels
+      # de cada servicio).
+      - "--entrypoints.internal.address=:${TRAEFIK_INTERNAL_PORT:-8081}"
 
     ports:
       - "80:80"
@@ -27,6 +33,46 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./config:/config:ro"
       - "./certs:/certs:ro"
+
+    # Router interno hacia document-store. Va en las labels de traefik y no en
+    # las de document-store a proposito: Traefik arma los routers de Docker
+    # con los contenedores que estan corriendo, asi que con document-store
+    # parado su router desapareceria y Traefik responderia 404 (que el
+    # orquestador leeria como "documento no encontrado"), sin pasar nunca por
+    # el circuit breaker. Definido aca existe siempre: con document-store
+    # caido la conexion falla, el circuit breaker lo cuenta y abre el
+    # circuito (503 al instante). document-store tiene una sola replica, asi
+    # que no se pierde balanceo. Solo escucha en el entrypoint interno: desde
+    # afuera document-store sigue sin ser accesible.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.document-store-internal.rule=PathPrefix(`/api/v1/documents`)"
+      - "traefik.http.routers.document-store-internal.entrypoints=internal"
+      - "traefik.http.routers.document-store-internal.service=document-store"
+      - "traefik.http.routers.document-store-internal.middlewares=cb-document-store"
+      - "traefik.http.services.document-store.loadbalancer.server.url=http://document-store:${DOCUMENT_STORE_PORT:-8000}"
+      # Aca el 503 si cuenta: document-store lo devuelve cuando MongoDB no
+      # responde. Sin middleware retry: un POST reintentado podria convertir
+      # un 201 en 409 (documento duplicado).
+      - "traefik.http.middlewares.cb-document-store.circuitbreaker.expression=NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.25"
+      - "traefik.http.middlewares.cb-document-store.circuitbreaker.checkperiod=1s"
+      - "traefik.http.middlewares.cb-document-store.circuitbreaker.fallbackduration=30s"
+      - "traefik.http.middlewares.cb-document-store.circuitbreaker.recoveryduration=10s"
+      # Respaldo de /extract para cuando no queda ninguna replica sana de
+      # pdf-extractext: sin replicas desaparece el router extract-internal (se
+      # arma con las labels de cada replica) y sin este respaldo Traefik
+      # responderia 404. Prioridad 1: solo atiende si extract-internal no
+      # existe. Mismo criterio de circuit breaker que cb-extract.
+      - "traefik.http.routers.extract-internal-respaldo.rule=PathPrefix(`/extract`)"
+      - "traefik.http.routers.extract-internal-respaldo.entrypoints=internal"
+      - "traefik.http.routers.extract-internal-respaldo.priority=1"
+      - "traefik.http.routers.extract-internal-respaldo.service=extract-respaldo"
+      - "traefik.http.routers.extract-internal-respaldo.middlewares=cb-extract-respaldo"
+      - "traefik.http.services.extract-respaldo.loadbalancer.server.url=http://pdf-extractext:${PDF_EXTRACTEXT_PORT:-8000}"
+      - "traefik.http.middlewares.cb-extract-respaldo.circuitbreaker.expression=NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 503, 0, 600) > 0.25 || ResponseCodeRatio(504, 600, 0, 600) > 0.25"
+      - "traefik.http.middlewares.cb-extract-respaldo.circuitbreaker.checkperiod=1s"
+      - "traefik.http.middlewares.cb-extract-respaldo.circuitbreaker.fallbackduration=30s"
+      - "traefik.http.middlewares.cb-extract-respaldo.circuitbreaker.recoveryduration=10s"
 
   orchestrator:
     build:
@@ -51,11 +97,12 @@ services:
       # Puerto del orquestador: lo usan uvicorn (main.py lee PORT), el
       # healthcheck y la label de Traefik. Una sola variable para los tres.
       PORT: ${ORCHESTRATOR_PORT:-8000}
-      # Cada URL usa el mismo puerto que el servicio al que apunta.
-      PDF_EXTRACT_BASE_URL: http://pdf-extractext:${PDF_EXTRACTEXT_PORT:-8000}
-      # Sin esto usa el default local (http://localhost:8002): dentro del
-      # contenedor no escucha nadie ahi y todo upload terminaria en 503.
-      DOCUMENT_STORE_BASE_URL: http://document-store:${DOCUMENT_STORE_PORT:-8000}
+      # Las dos llamadas salen por el entrypoint interno de Traefik
+      # (TRAEFIK_INTERNAL_PORT): Traefik balancea entre las replicas y aplica
+      # el circuit breaker de cada servicio. Cada router interno elige el
+      # servicio por el path (/extract o /api/v1/documents).
+      PDF_EXTRACT_BASE_URL: http://traefik:${TRAEFIK_INTERNAL_PORT:-8081}
+      DOCUMENT_STORE_BASE_URL: http://traefik:${TRAEFIK_INTERNAL_PORT:-8081}
       # Traefik termina TLS y manda X-Forwarded-Proto/For: el orquestador solo
       # los acepta de la red del stack (misma subred que networks.default), no
       # de cualquier origen. Sin esto usa 127.0.0.1 y las URLs que arma (p. ej.
@@ -67,6 +114,9 @@ services:
     # guarda con document-store (ADR-0003 del orquestador), asi que sin alguno
     # de los dos cada upload falla.
     depends_on:
+      # Las llamadas a los dos servicios pasan por Traefik.
+      traefik:
+        condition: service_started
       document-store:
         condition: service_healthy
       pdf-extractext:
@@ -173,6 +223,27 @@ services:
       - "traefik.http.middlewares.extract-reintento.retry.attempts=3"
       - "traefik.http.middlewares.extract-reintento.retry.initialinterval=100ms"
       - "traefik.http.routers.extract.middlewares=extract-reintento"
+      - "traefik.http.routers.extract.service=extract"
+      # Router interno: el que usa el orquestador (entrypoint internal, sin
+      # publicar en el host). Primero el circuit breaker y despues el retry:
+      # con el circuito abierto Traefik responde 503 sin llamar a ninguna
+      # replica ni reintentar.
+      - "traefik.http.routers.extract-internal.rule=PathPrefix(`/extract`)"
+      - "traefik.http.routers.extract-internal.entrypoints=internal"
+      # Por encima del respaldo que esta en las labels de traefik.
+      - "traefik.http.routers.extract-internal.priority=10"
+      - "traefik.http.routers.extract-internal.service=extract"
+      - "traefik.http.routers.extract-internal.middlewares=cb-extract,extract-reintento"
+      # Circuit breaker: abre el circuito con mas de 30 % de errores de red o
+      # mas de 25 % de respuestas 5xx, medidos cada checkperiod. El 503 queda
+      # afuera a proposito: es el backpressure de pdf-extractext (cola llena,
+      # con Retry-After), no una falla. Abierto, responde 503 durante
+      # fallbackduration; despues deja pasar trafico de a poco durante
+      # recoveryduration y, si no falla, vuelve a cerrarse.
+      - "traefik.http.middlewares.cb-extract.circuitbreaker.expression=NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 503, 0, 600) > 0.25 || ResponseCodeRatio(504, 600, 0, 600) > 0.25"
+      - "traefik.http.middlewares.cb-extract.circuitbreaker.checkperiod=1s"
+      - "traefik.http.middlewares.cb-extract.circuitbreaker.fallbackduration=30s"
+      - "traefik.http.middlewares.cb-extract.circuitbreaker.recoveryduration=10s"
 
   document-store:
     build:
@@ -229,8 +300,8 @@ services:
       start_period: 10s
       start_interval: 1s
 
-    # Sin labels de Traefik: es interno, solo lo llama el orquestador por la
-    # red de Compose (exposedbydefault=false ya lo deja fuera del proxy).
+    # Sin labels de Traefik: el router interno que lo alcanza esta definido en
+    # las labels de traefik (ver ahi por que). Desde afuera no es accesible.
 
   # Hoy lo usa solo document-store (base document_store). pdf-extractext ya
   # no guarda nada desde su 2.0.0.
