@@ -148,6 +148,17 @@ services:
       - "traefik.http.routers.orchestrator.entrypoints=websecure"
       - "traefik.http.routers.orchestrator.tls=true"
       - "traefik.http.services.orchestrator.loadbalancer.server.port=${ORCHESTRATOR_PORT:-8000}"
+      # Rate limit (patron Rate Limiting): cada IP de origen puede hacer en
+      # promedio RATE_LIMIT_AVERAGE requests por segundo, con rafagas de hasta
+      # RATE_LIMIT_BURST. Lo que pasa del limite recibe 429 Too Many Requests
+      # de Traefik, sin llegar al orquestador: protege a las replicas, a
+      # pdf-extractext (cada upload es una extraccion) y a document-store de un
+      # cliente que abusa. Solo en la entrada publica: las rutas internas entre
+      # servicios y /extract del TP (extract.proyecto.localhost) no se limitan.
+      - "traefik.http.middlewares.orchestrator-ratelimit.ratelimit.average=${RATE_LIMIT_AVERAGE:-20}"
+      - "traefik.http.middlewares.orchestrator-ratelimit.ratelimit.burst=${RATE_LIMIT_BURST:-40}"
+      - "traefik.http.middlewares.orchestrator-ratelimit.ratelimit.period=1s"
+      - "traefik.http.routers.orchestrator.middlewares=orchestrator-ratelimit"
 
   pdf-extractext:
     build:
@@ -271,7 +282,16 @@ services:
       DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
       DATABASE_NAME: document_store
       DATABASE_TIMEOUT_MS: 3000
+      # Cache de documentos (patron Cache-Aside, ver el README de
+      # document-store): GET /api/v1/documents/{id} responde desde Redis sin
+      # consultar MongoDB. Redis es otro backing service (12-Factor IV), con su
+      # clave desde .env. Si Redis no responde, document-store lee de MongoDB
+      # (en REDIS_TIMEOUT_MS): el cache nunca es un punto de falla.
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CACHE_TTL_SECONDS: 300
+      REDIS_TIMEOUT_MS: 500
 
+    # Sin depender de redis a proposito: document-store funciona sin cache.
     depends_on:
       mongo:
         condition: service_healthy
@@ -337,6 +357,35 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # Cache de document-store. Solo guarda copias con vencimiento (la fuente de
+  # verdad es MongoDB): sin volumen ni snapshots, y con memoria acotada que
+  # descarta lo menos usado (allkeys-lru) en lugar de rechazar escrituras.
+  # Sin ports: solo lo alcanza document-store dentro de la red del stack.
+  redis:
+    image: redis:8.10.3-alpine
+    container_name: redis
+    restart: unless-stopped
+
+    environment:
+      # Obligatoria, como la de MongoDB (12-Factor III). Ver .env.example.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?definir REDIS_PASSWORD en .env (ver .env.example)}
+
+    # La clave se pasa desde la variable dentro del contenedor ($$ evita que
+    # compose la expanda), no escrita en el comando.
+    command:
+      [
+        "sh",
+        "-c",
+        'exec redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory 64mb --maxmemory-policy allkeys-lru --save "" --appendonly no',
+      ]
+
+    healthcheck:
+      test: ["CMD-SHELL", 'redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
 volumes:
   mongo_data:
