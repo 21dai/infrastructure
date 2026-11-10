@@ -112,6 +112,8 @@ Variables opcionales (si no se definen, se usan los valores por defecto):
 | `PDF_EXTRACTEXT_PORT` | `8000` | Puerto de pdf-extractext: `PORT`, healthcheck, label de Traefik y la URL que usa el orquestador |
 | `DOCUMENT_STORE_PORT` | `8000` | Puerto de document-store: `PORT`, healthcheck y la URL del router interno de Traefik |
 | `TRAEFIK_INTERNAL_PORT` | `8081` | Entrypoint interno de Traefik (sin publicar): por ahí el orquestador llama a pdf-extractext y a document-store |
+| `RATE_LIMIT_AVERAGE` | `20` | Rate limit de la entrada pública del orquestador: requests por segundo en promedio por IP de origen (ver [Rate limit en Traefik](#rate-limit-en-traefik)) |
+| `RATE_LIMIT_BURST` | `40` | Ráfaga máxima del rate limit antes de responder `429` |
 | `STACK_SUBNET` | `172.28.0.0/16` | Subred de la red del stack. El orquestador solo acepta `X-Forwarded-*` de esta red (`FORWARDED_ALLOW_IPS`). Cambiarla solo si choca con otra red de la máquina (`docker network inspect`) |
 
 Cada puerto sale de **una sola variable** (12-Factor VII): no hay ningún `8000`
@@ -125,6 +127,8 @@ antes del primer `up` por una propia, por ejemplo generada en PowerShell con
 `[guid]::NewGuid().ToString("N")` (32 caracteres hexadecimales, no hace falta
 escaparla en la URL de conexión). La clave nunca va en los comandos ni en el
 repo: los comandos de `mongosh` de este README la toman del contenedor.
+Lo mismo con `REDIS_PASSWORD`, la clave de Redis (el cache de document-store):
+es obligatoria y `.env.example` trae un valor para reemplazar.
 
 > Los comandos con `--eval` están escritos para PowerShell (también el 5.1 de
 > Windows): comillas dobles de PowerShell, `` `$ `` para que la variable la
@@ -448,6 +452,70 @@ Lo mismo con pdf-extractext (`docker compose stop pdf-extractext`, las 5
 réplicas): atiende el router de respaldo, falla la conexión y se abre
 `cb-extract-respaldo`.
 
+## Rate limit en Traefik
+
+La entrada pública del orquestador (`orchestrator.proyecto.localhost`) tiene un
+middleware `ratelimit` de Traefik (patrón **Rate Limiting**): cada IP de origen
+puede hacer en promedio `RATE_LIMIT_AVERAGE` requests por segundo (20), con
+ráfagas de hasta `RATE_LIMIT_BURST` (40). Lo que pasa del límite recibe
+`429 Too Many Requests` de Traefik **sin llegar al orquestador**.
+
+Por qué ahí: cada `POST` de un PDF le cuesta una extracción a pdf-extractext y
+un alta a document-store. Cortar el abuso en la entrada protege a todo el
+sistema y a los demás clientes. No se limitan las rutas internas entre
+servicios (entrypoint `:8081`) ni `/extract` del TP
+(`extract.proyecto.localhost`), que se mide con pruebas de carga.
+
+Para mostrarlo, conviene bajar el límite: con los valores por defecto hacen
+falta muchas requests simultáneas (medido: de 100 a la vez, 72 dieron `200` y
+28 `429`). En `.env`:
+
+```text
+RATE_LIMIT_AVERAGE=1
+RATE_LIMIT_BURST=5
+```
+
+Recrear el orquestador para que Traefik tome las labels nuevas y mandar 10
+requests seguidas: las primeras 5 (la ráfaga) dan `200` y después aparecen los
+`429` (se recupera 1 por segundo).
+
+```powershell
+docker compose up -d orchestrator
+1..10 | ForEach-Object { curl.exe -k -s -o NUL -w "%{http_code} " https://orchestrator.proyecto.localhost/health }
+# 200 200 200 200 200 200 429 200 429 200
+```
+
+Después, sacar esas dos líneas de `.env` y volver a recrear el orquestador.
+
+En el dashboard aparece el middleware `orchestrator-ratelimit` (tipo
+`ratelimit`) en el router `orchestrator`. Para una prueba de carga contra el
+orquestador, subir `RATE_LIMIT_AVERAGE` y `RATE_LIMIT_BURST` en `.env` y
+recrear el orquestador (`docker compose up -d orchestrator`).
+
+## Cache en Redis
+
+`redis` es el cache de document-store (patrón **Cache-Aside**, explicado en el
+README de document-store): `GET /api/v1/documents/{id}` responde desde Redis
+sin consultar MongoDB, y el alta, el renombre y el borrado lo mantienen al día.
+
+- Backing service (12-Factor IV): document-store lo recibe en `REDIS_URL`, con
+  la clave de `REDIS_PASSWORD`.
+- Solo copias con vencimiento (`CACHE_TTL_SECONDS=300`): sin volumen ni
+  snapshots, y con memoria acotada (64 MB) que descarta lo menos usado
+  (`allkeys-lru`). Sin `ports`: solo lo alcanza document-store.
+- **No es un punto de falla:** document-store no depende de redis para
+  arrancar y, si Redis no responde, lee de MongoDB (en `REDIS_TIMEOUT_MS`).
+
+Para verlo: subir un PDF por el orquestador y mirar las claves.
+
+```powershell
+docker exec redis sh -c 'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" keys "documento:*"'
+docker exec redis sh -c 'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ttl documento:1'
+```
+
+Con `docker compose stop redis` el flujo sigue funcionando (desde MongoDB) y
+document-store solo registra un warning.
+
 ## Traefik Dashboard
 
 El dashboard local está disponible **solo desde la máquina anfitriona** en:
@@ -496,14 +564,14 @@ docker compose logs orchestrator --since 2m | Select-String "GET /openapi.json"
 Cliente
    │
    ▼
-Traefik ──────── POST /extract ────────┐
-   │                                   │
-   ▼                                   ▼
+Traefik (TLS, rate limit) ── POST /extract ──┐
+   │                                         │
+   ▼                                         ▼
 Orchestrator Service ──▶ Traefik :8081 ──▶ PDF Extractext (x5, sin base)
                    (interno, circuit breaker)
                                │
                                ▼
-                         Document Store
+                         Document Store ──▶ Redis (cache)
    │  base document_store
    ▼
 MongoDB
