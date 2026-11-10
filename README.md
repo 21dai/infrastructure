@@ -28,6 +28,8 @@ infrastructure/
 │   └── tls.yml
 ├── docker-compose.yml
 ├── docker-compose.override.yml
+├── scripts/
+│   └── levantar.ps1
 ├── .env.example
 ├── .gitignore
 └── README.md
@@ -190,6 +192,40 @@ docker compose exec -e FCV=8.0 mongo sh -c "mongosh --quiet -u `$MONGO_INITDB_RO
 > vieja con código nuevo.
 
 ## Levantar la infraestructura
+
+### Con un script (Docker Desktop o Docker en WSL)
+
+Desde PowerShell, en la carpeta `infrastructure`:
+
+```powershell
+.\scripts\levantar.ps1           # prepara, construye, levanta y espera a que todo este healthy
+.\scripts\levantar.ps1 -SinBuild # sin reconstruir las imágenes
+.\scripts\levantar.ps1 -Apagar   # apagar (los datos de MongoDB quedan en el volumen)
+```
+
+El script:
+
+- **Prepara lo que falte** la primera vez: si no hay `.env`, lo copia de
+  `.env.example` con claves nuevas de MongoDB y Redis (no las muestra); si no
+  están los certificados, los genera con `mkcert` (tiene que estar
+  instalado). Un `.env` que ya existe no lo toca: solo avisa qué variables le
+  faltan respecto de `.env.example`.
+- Verifica que estén clonados los repos hermanos.
+- **Detecta dónde está Docker**: Docker Desktop si responde en Windows y, si
+  no, Docker instalado dentro de una distro de WSL (corre los comandos con
+  `wsl.exe`). Se puede forzar con `-Docker windows` o `-Docker wsl`, y elegir
+  la distro con `-Distro Ubuntu`. Con Docker en WSL deja un proceso de WSL
+  oculto para que la distro no se apague al cerrar la terminal; `-Apagar` lo
+  termina.
+- No levanta nada si otro stack ocupa el puerto 443 (por ejemplo el del TP de
+  `pdf-extractext`) y dice cómo apagarlo.
+- Levanta con `docker compose up -d --build --wait` y al final prueba
+  `https://orchestrator.proyecto.localhost/health` desde Windows.
+
+Si PowerShell no deja correr scripts:
+`powershell -ExecutionPolicy Bypass -File .\scripts\levantar.ps1`.
+
+### Con docker compose
 
 Desde la carpeta `infrastructure`:
 
