@@ -110,7 +110,8 @@ Variables opcionales (si no se definen, se usan los valores por defecto):
 |---|---|---|
 | `ORCHESTRATOR_PORT` | `8000` | Puerto del orquestador: `PORT`, su healthcheck y la label de Traefik |
 | `PDF_EXTRACTEXT_PORT` | `8000` | Puerto de pdf-extractext: `PORT`, healthcheck, label de Traefik y la URL que usa el orquestador |
-| `DOCUMENT_STORE_PORT` | `8000` | Puerto de document-store: `PORT`, healthcheck y la URL que usa el orquestador |
+| `DOCUMENT_STORE_PORT` | `8000` | Puerto de document-store: `PORT`, healthcheck y la URL del router interno de Traefik |
+| `TRAEFIK_INTERNAL_PORT` | `8081` | Entrypoint interno de Traefik (sin publicar): por ahí el orquestador llama a pdf-extractext y a document-store |
 | `STACK_SUBNET` | `172.28.0.0/16` | Subred de la red del stack. El orquestador solo acepta `X-Forwarded-*` de esta red (`FORWARDED_ALLOW_IPS`). Cambiarla solo si choca con otra red de la máquina (`docker network inspect`) |
 
 Cada puerto sale de **una sola variable** (12-Factor VII): no hay ningún `8000`
@@ -249,7 +250,9 @@ Con MongoDB detenido, document-store pasa a `unhealthy` (su `/ready` responde
 
 `pdf-extractext` corre con 5 réplicas (el máximo del TP de carga) y sin
 `container_name`, porque un nombre fijo impide crear réplicas. El orquestador
-lo sigue encontrando por el nombre del servicio (`http://pdf-extractext:8000`).
+lo llama a través de Traefik (`http://traefik:8081/extract`, router
+`extract-internal`), que reparte las llamadas entre las 5 réplicas y aplica el
+circuit breaker (ver [Circuit breaker en Traefik](#circuit-breaker-en-traefik)).
 
 `pdf-extractext` solo expone `POST /extract`: desde la 2.0.0 ya no tiene CRUD
 ni base de datos (ADR-0008 de ese repo), así que una caída de MongoDB o de
@@ -271,9 +274,11 @@ texto extraído, la cantidad de páginas y el SHA-256 que calcula del PDF
 (ADR-0003 de `orchestrator-service`). Responde `201`, o `409` si ese checksum
 ya está guardado.
 
-- **Interno**: no tiene labels de Traefik ni puertos publicados. Solo lo llama
-  el orquestador por la red de Compose (`http://document-store:8000`, variable
-  `DOCUMENT_STORE_BASE_URL`).
+- **Interno**: no tiene puertos publicados ni routers en los entrypoints
+  públicos. Solo lo llama el orquestador a través del entrypoint interno de
+  Traefik (`http://traefik:8081/api/v1/documents`, router
+  `document-store-internal`, variable `DOCUMENT_STORE_BASE_URL`), que aplica el
+  circuit breaker.
 - **MongoDB** del stack, en la base `document_store` (colecciones `documents`
   y `counters`). Es la única base del stack: ningún otro servicio usa MongoDB.
 - pdf-extractext y el orquestador esperan a que esté `healthy` antes de
@@ -371,6 +376,78 @@ curl.exe -I http://orchestrator.proyecto.localhost/health
 # Location: https://orchestrator.proyecto.localhost/health
 ```
 
+## Circuit breaker en Traefik
+
+El tráfico entre servicios pasa por Traefik, por un entrypoint **interno**
+(`:8081`, sin publicar en el host: `curl.exe http://localhost:8081` no conecta).
+El orquestador tiene `PDF_EXTRACT_BASE_URL` y `DOCUMENT_STORE_BASE_URL` en
+`http://traefik:8081`, y Traefik elige el servicio por el path:
+
+| Router (entrypoint `internal`) | Path | Middlewares | Dónde está definido |
+|---|---|---|---|
+| `extract-internal` | `/extract` | `cb-extract`, `extract-reintento` | labels de `pdf-extractext` (una entrada por réplica: balanceo real) |
+| `extract-internal-respaldo` | `/extract` (prioridad 1) | `cb-extract-respaldo` | labels de `traefik`: atiende solo si no queda ninguna réplica sana |
+| `document-store-internal` | `/api/v1/documents` | `cb-document-store` | labels de `traefik` |
+
+Por qué document-store y el respaldo de `/extract` están en las labels de
+`traefik`: Traefik arma los routers de Docker con los contenedores que están
+**corriendo**. Si el router de document-store estuviera en sus propias labels,
+con document-store parado el router desaparecería y Traefik respondería `404`
+(el orquestador lo leería como "documento no encontrado") sin pasar nunca por
+el circuit breaker. Definidos en `traefik` existen siempre: con el servicio
+caído la conexión falla (`502`), el breaker lo cuenta y abre el circuito.
+
+Cómo decide cada circuit breaker (labels `circuitbreaker.*`):
+
+| Middleware | Abre el circuito si… | No cuenta |
+|---|---|---|
+| `cb-extract`, `cb-extract-respaldo` | más de 30 % de errores de red, o más de 25 % de `5xx` | el `503` (backpressure de pdf-extractext: cola llena con `Retry-After`) |
+| `cb-document-store` | más de 30 % de errores de red, o más de 25 % de `5xx` (el `503` sí: MongoDB caído) | — |
+
+Estados: **cerrado** (pasa todo) → **abierto** durante `fallbackduration`
+(30 s: Traefik responde `503` al instante, sin llamar al servicio) →
+**recuperación** durante `recoveryduration` (10 s: deja pasar tráfico de a poco)
+→ cerrado si no hay fallas. La expresión se evalúa cada `checkperiod` (1 s).
+
+Reintentos (uno por tipo, sin multiplicarse):
+
+- Réplica de pdf-extractext caída o apagándose → `extract-reintento` de Traefik
+  (3 intentos), seguro porque `/extract` no guarda nada.
+- document-store → sin `retry` en Traefik: un `POST` reintentado podría
+  convertir un `201` en `409`.
+- Traefik inalcanzable (fallo al conectar) → lo reintenta el orquestador
+  (ver su ADR-0005).
+
+### Mostrar cómo se abre y se cierra el circuito
+
+1. En el dashboard (<http://localhost:8080/dashboard/#/http/routers>) aparecen
+   `extract-internal`, `extract-internal-respaldo` y `document-store-internal`
+   con su middleware (`HTTP Middlewares` → `cb-*`, tipo `circuitbreaker`).
+2. Flujo normal: `POST` de un PDF → `201` (ver
+   [Probar el flujo completo con un PDF](#probar-el-flujo-completo-con-un-pdf)).
+3. Abrir el circuito: apagar document-store y subir varios PDFs.
+
+   ```powershell
+   docker compose stop document-store
+   1..5 | ForEach-Object { curl.exe -k -s -o NUL -w "%{http_code} %{time_total}s`n" -F "file=@documento.pdf" https://orchestrator.proyecto.localhost/api/v1/documents }
+   ```
+
+   Las primeras tardan unos segundos (Traefik intenta conectar y falla); con el
+   circuito abierto responden `503` en milisegundos, sin llamar a
+   document-store. El orquestador devuelve un Problem Details con `503`.
+4. Cerrar el circuito: volver a levantarlo y esperar `fallbackduration` +
+   `recoveryduration` (~40 s).
+
+   ```powershell
+   docker compose start document-store
+   ```
+
+   Pasado ese tiempo, el mismo `POST` (con otro PDF) vuelve a dar `201`.
+
+Lo mismo con pdf-extractext (`docker compose stop pdf-extractext`, las 5
+réplicas): atiende el router de respaldo, falla la conexión y se abre
+`cb-extract-respaldo`.
+
 ## Traefik Dashboard
 
 El dashboard local está disponible **solo desde la máquina anfitriona** en:
@@ -422,10 +499,11 @@ Cliente
 Traefik ──────── POST /extract ────────┐
    │                                   │
    ▼                                   ▼
-Orchestrator Service ──────▶ PDF Extractext (x5, sin base)
-   │
-   ▼
-Document Store
+Orchestrator Service ──▶ Traefik :8081 ──▶ PDF Extractext (x5, sin base)
+                   (interno, circuit breaker)
+                               │
+                               ▼
+                         Document Store
    │  base document_store
    ▼
 MongoDB
@@ -439,10 +517,11 @@ Traefik termina TLS y le pasa al orquestador `X-Forwarded-Proto` y
 ejemplo `instance` en los errores) salen con `https://`, y un contenedor que le
 hable sin pasar por Traefik no puede falsear la IP ni el esquema del cliente.
 
-El Orchestrator se comunica internamente con `pdf-extractext` (extrae el texto
-con `POST /extract`) y con `document-store` (guarda el documento con
-`POST /api/v1/documents`) mediante la red de Docker Compose. `document-store`
-no está expuesto en Traefik.
+El Orchestrator se comunica con `pdf-extractext` (extrae el texto con
+`POST /extract`) y con `document-store` (guarda el documento con
+`POST /api/v1/documents`) a través del entrypoint interno de Traefik (`:8081`,
+sin publicar), que balancea entre las réplicas y aplica el circuit breaker de
+cada servicio. `document-store` no está expuesto en los entrypoints públicos.
 
 ## Detener la infraestructura
 
