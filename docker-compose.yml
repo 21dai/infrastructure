@@ -13,6 +13,10 @@ services:
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      # Ningun router escucha en web (:80): todo lo que llega por HTTP se
+      # redirige a HTTPS en vez de responder 404.
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
 
     ports:
       - "80:80"
@@ -33,27 +37,67 @@ services:
     image: orchestrator-service:${ORCHESTRATOR_TAG:?definir ORCHESTRATOR_TAG en .env (ver .env.example)}
 
     restart: unless-stopped
+    # 12-Factor IX (apagado ordenado). Ante SIGTERM uvicorn deja de aceptar
+    # conexiones y espera las requests en curso hasta GRACEFUL_SHUTDOWN_SECONDS
+    # (60 s): lo mismo que puede tardar una request esperando a pdf-extractext
+    # (HTTP_TIMEOUT_SECONDS=60 en docker-compose.override.yml). Docker manda
+    # SIGKILL recien a los 70 s: 10 s de margen para cerrar el lifespan.
+    stop_grace_period: 70s
 
     environment:
-      PDF_EXTRACT_BASE_URL: http://pdf-extractext:8000
+      HOST: 0.0.0.0
+      # Menor que stop_grace_period (ver arriba).
+      GRACEFUL_SHUTDOWN_SECONDS: 60
+      # Puerto del orquestador: lo usan uvicorn (main.py lee PORT), el
+      # healthcheck y la label de Traefik. Una sola variable para los tres.
+      PORT: ${ORCHESTRATOR_PORT:-8000}
+      # Cada URL usa el mismo puerto que el servicio al que apunta.
+      PDF_EXTRACT_BASE_URL: http://pdf-extractext:${PDF_EXTRACTEXT_PORT:-8000}
       # Sin esto usa el default local (http://localhost:8002): dentro del
       # contenedor no escucha nadie ahi y todo upload terminaria en 503.
-      DOCUMENT_STORE_BASE_URL: http://document-store:8000
+      DOCUMENT_STORE_BASE_URL: http://document-store:${DOCUMENT_STORE_PORT:-8000}
+      # Traefik termina TLS y manda X-Forwarded-Proto/For: el orquestador solo
+      # los acepta de la red del stack (misma subred que networks.default), no
+      # de cualquier origen. Sin esto usa 127.0.0.1 y las URLs que arma (p. ej.
+      # "instance" de los Problem Details) salen con http:// en vez de https://.
+      FORWARDED_ALLOW_IPS: ${STACK_SUBNET:-172.28.0.0/16}
 
-    # Extrae con pdf-extractext y guarda con document-store (ADR-0003 del
-    # orquestador): sin alguno de los dos, cada upload falla.
+    # Orden de arranque: mongo -> document-store -> pdf-extractext ->
+    # orchestrator. El orquestador es el ultimo: extrae con pdf-extractext y
+    # guarda con document-store (ADR-0003 del orquestador), asi que sin alguno
+    # de los dos cada upload falla.
     depends_on:
-      pdf-extractext:
-        condition: service_healthy
       document-store:
         condition: service_healthy
+      pdf-extractext:
+        condition: service_healthy
+
+    # Reemplaza el HEALTHCHECK del Dockerfile del orquestador: mismo chequeo
+    # liviano que los demas servicios (socket, sin cargar ssl ni email) y cada
+    # 1 s mientras arranca, para que Traefik le mande trafico enseguida
+    # (Traefik ignora los contenedores que todavia no estan healthy).
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-S",
+          "-I",
+          "-c",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
 
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.orchestrator.rule=Host(`orchestrator.proyecto.localhost`)"
       - "traefik.http.routers.orchestrator.entrypoints=websecure"
       - "traefik.http.routers.orchestrator.tls=true"
-      - "traefik.http.services.orchestrator.loadbalancer.server.port=8000"
+      - "traefik.http.services.orchestrator.loadbalancer.server.port=${ORCHESTRATOR_PORT:-8000}"
 
   pdf-extractext:
     build:
@@ -76,18 +120,28 @@ services:
           cpus: "1.0"
           memory: 1G
 
+    # Orden de arranque que pidio la catedra: documentos, extraccion y por
+    # ultimo el orquestador. pdf-extractext NO necesita a document-store para
+    # funcionar (no lo llama nunca): esperarlo es solo el orden de arranque.
+    # Una caida posterior de document-store o de MongoDB no lo afecta.
+    depends_on:
+      document-store:
+        condition: service_healthy
+
     # Desde la 2.0.0 no usa base de datos (ADR-0008 de pdf-extractext): solo
-    # extrae. Por eso no recibe DATABASE_* ni depende de mongo: arranca sin
-    # esperarlo y una caida de MongoDB no lo afecta.
+    # extrae. Por eso no recibe DATABASE_*.
     environment:
       HOST: 0.0.0.0
-      PORT: 8000
+      # Mismo valor para PORT, el healthcheck, la label de Traefik y la URL
+      # que usa el orquestador.
+      PORT: ${PDF_EXTRACTEXT_PORT:-8000}
       MAX_PDF_SIZE_BYTES: 10485760
 
     # Chequeo liviano: python sin site ni imports pesados (-S -I) y un socket
     # en lugar de urllib, que carga ssl y email. Medido en reposo: urllib cada
     # 5 s gastaba 12 % de un nucleo por replica; asi, cada 10 s, ~3 %. Al
-    # arrancar chequea cada 1 s para volver rapido al balanceo.
+    # arrancar chequea cada 1 s para volver rapido al balanceo. El puerto sale
+    # de PORT (os es un modulo congelado: no cambia el costo del chequeo).
     healthcheck:
       test:
         [
@@ -96,7 +150,7 @@ services:
           "-S",
           "-I",
           "-c",
-          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
         ]
       interval: 10s
       timeout: 5s
@@ -111,7 +165,7 @@ services:
       - "traefik.http.routers.extract.rule=Host(`extract.proyecto.localhost`) && PathPrefix(`/extract`)"
       - "traefik.http.routers.extract.entrypoints=websecure"
       - "traefik.http.routers.extract.tls=true"
-      - "traefik.http.services.extract.loadbalancer.server.port=8000"
+      - "traefik.http.services.extract.loadbalancer.server.port=${PDF_EXTRACTEXT_PORT:-8000}"
       # Si una replica se cae o se esta apagando, reintenta en otra. Es seguro
       # porque /extract no guarda estado: procesar dos veces el mismo PDF no
       # cambia nada. El orquestador, en cambio, no reintenta sus POST (podrian
@@ -129,10 +183,17 @@ services:
     # Sin container_name, igual que pdf-extractext: deja escalarlo con
     # --scale y el orquestador lo encuentra por el nombre del servicio.
     restart: unless-stopped
+    # 12-Factor IX. Requests cortas (consultas e inserts en MongoDB con timeout
+    # de 3 s): uvicorn espera hasta GRACEFUL_SHUTDOWN_SECONDS (10 s) y Docker
+    # manda SIGKILL recien a los 15 s, con margen para cerrar el cliente de Mongo.
+    stop_grace_period: 15s
 
     environment:
       HOST: 0.0.0.0
-      PORT: 8000
+      # Menor que stop_grace_period (ver arriba).
+      GRACEFUL_SHUTDOWN_SECONDS: 10
+      # Mismo valor para PORT, el healthcheck y la URL que usa el orquestador.
+      PORT: ${DOCUMENT_STORE_PORT:-8000}
       # Mismo MongoDB del stack, con su propia base: los documentos guardados
       # no se mezclan con los de pdf_extract. Credenciales desde .env
       # (12-Factor III); si la clave tiene @ : / ? va URL-encoded.
@@ -144,11 +205,14 @@ services:
       mongo:
         condition: service_healthy
 
-    # Reemplaza el HEALTHCHECK del Dockerfile (urllib cada 30 s): el
-    # orquestador espera a que este healthy, y con 30 s de intervalo tardaria
-    # medio minuto en arrancar. Mismo chequeo liviano que pdf-extractext
+    # Reemplaza el HEALTHCHECK del Dockerfile (urllib cada 30 s): pdf-extractext
+    # y el orquestador esperan a que este healthy, y con 30 s de intervalo
+    # tardarian medio minuto en arrancar. Mismo chequeo liviano que los demas
     # (socket, sin cargar ssl ni email) y cada 1 s mientras arranca.
-    # /health no toca MongoDB: solo dice que el proceso responde.
+    # Usa /ready (readiness): hace ping a MongoDB y responde 503 si la base no
+    # contesta, asi que con Mongo caido document-store pasa a unhealthy y
+    # Traefik/compose lo ven. El ping falla en DATABASE_TIMEOUT_MS (3 s), menos
+    # que el timeout del chequeo (5 s). /health (liveness) no toca la base.
     healthcheck:
       test:
         [
@@ -157,7 +221,7 @@ services:
           "-S",
           "-I",
           "-c",
-          "import socket; s = socket.create_connection(('127.0.0.1', 8000), 2); s.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
+          "import os, socket; s = socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2); s.sendall(b'GET /ready HTTP/1.0\\r\\n\\r\\n'); raise SystemExit(0 if b' 200 ' in s.recv(64) else 1)",
         ]
       interval: 10s
       timeout: 5s
@@ -171,7 +235,10 @@ services:
   # Hoy lo usa solo document-store (base document_store). pdf-extractext ya
   # no guarda nada desde su 2.0.0.
   mongo:
-    image: mongo:7-jammy
+    # Version completa (no un tag flotante como 7-jammy): la misma imagen en
+    # cada build. 8.0 es la rama de soporte largo y el salto desde un volumen
+    # 7.0 esta soportado (ver "Actualizar MongoDB" en el README).
+    image: mongo:8.0.34
     container_name: mongo
     restart: unless-stopped
 
@@ -202,3 +269,14 @@ services:
 
 volumes:
   mongo_data:
+
+# Red del stack con subred fija: el orquestador solo confia en los headers
+# X-Forwarded-* que vienen de esta red (Traefik), ver FORWARDED_ALLOW_IPS.
+# 172.28.0.0/16 no choca con las redes que crea Docker por defecto
+# (172.17-172.2x); si choca con otra red de la maquina, cambiar STACK_SUBNET
+# en .env (y hacer docker compose down para recrear la red).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${STACK_SUBNET:-172.28.0.0/16}
